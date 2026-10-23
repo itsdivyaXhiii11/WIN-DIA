@@ -136,7 +136,7 @@ const asStoreProduct = (
     price: Number(product.price.replace(/[^0-9.]/g, "")),
     image: product.image[0].src,
     countInStock: 100,
-    netWeight: 480,
+    netWeight: 240, // 1 bundle = 6 packets × 40g = 240g
   };
 }; 
 

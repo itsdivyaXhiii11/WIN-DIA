@@ -28,6 +28,7 @@ export type Product = {
   readonly rating?: string;
   readonly reviews?: string;
   readonly reviewList?: readonly string[];
+  readonly netWeight?: number | string; // Weight in grams (e.g., 480 or "480g")
 };
 
 /**
@@ -74,10 +75,7 @@ export function toStoreProduct(
   product: Product,
   theme: ProductTheme
 ) {
-  // For combo products, use the UUID directly (backend expects this)
-  const isComboProduct = product.id === '9d17cedd-4abd-4765-af1e-f368d17bad32' || 
-                          theme === 'combo';
-  const id = isComboProduct ? product.id : toRouteId(theme, product);
+  const id = toRouteId(theme, product);
 
   let image: string;
 
@@ -119,7 +117,14 @@ export function toStoreProduct(
     image,
 
     countInStock: 100,
-    netWeight: (product as any).netWeight || 200, // Use product-specific netWeight if available
+    
+    // Use actual product weight (numeric grams)
+    // For WIN-DIA bundles: 12 packets × 40g = 480g per bundle
+    netWeight: typeof product.netWeight === "number" 
+      ? product.netWeight 
+      : (typeof product.netWeight === "string" 
+          ? parseInt(product.netWeight.replace(/[^0-9]/g, ""), 10) || 480
+          : 480),
   };
 
   // Preserve the real database UUID if available (from API products)

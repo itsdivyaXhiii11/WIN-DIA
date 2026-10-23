@@ -22,7 +22,6 @@ const PAYMENT_EVENT = {
   INITIATED: 'payment.initiated',
   SUCCEEDED: 'payment.succeeded',
   FAILED: 'payment.failed',
-  RECONCILE: 'payment.reconcile_required',
 } as const;
 
 const WEBHOOK_EVENT = {
@@ -38,44 +37,33 @@ export interface VerifyPaymentDTO {
   razorpay_signature: string;
 }
 
-export interface ConfirmPaymentInput {
-  razorpayOrderId: string;
-  razorpayPaymentId: string;
-  /** Internal order UUID the caller claims this payment belongs to (verify route). Optional for webhooks. */
-  expectedOrderId?: string;
-  source: 'verify' | 'webhook';
-}
-
-export type ConfirmPaymentResult =
-  | { outcome: 'confirmed'; orderId: string }
-  | { outcome: 'already_processed'; orderId: string }
-  | { outcome: 'rejected'; reason: string };
-
 export interface PaymentService {
   initiateRazorpayPayment(orderId: string, amount: number, orderNumber: string): Promise<Result<{ payment: Payment; razorpayOrderId: string }, AppError>>;
   verifySignature(dto: VerifyPaymentDTO): Promise<Result<boolean, AppError>>;
-  confirmVerifiedRazorpayPayment(input: ConfirmPaymentInput): Promise<Result<ConfirmPaymentResult, AppError>>;
+  processSuccessfulPayment(paymentId: string, transactionId: string, rawPayload?: Record<string, unknown>): Promise<Result<Payment, AppError>>;
   processFailedPayment(paymentId: string, reason?: string, rawPayload?: Record<string, unknown>): Promise<Result<Payment, AppError>>;
   logPaymentEvent(paymentId: string, eventType: string, payload: Record<string, unknown>): Promise<Result<PaymentEvent, AppError>>;
-  handleWebhook(rawBody: string, signature: string, eventId?: string | null): Promise<Result<boolean, AppError>>;
+  handleWebhook(payload: Record<string, unknown>, signature: string): Promise<Result<boolean, AppError>>;
 }
 
 export class PaymentServiceImpl implements PaymentService {
   private paymentRepo: PaymentRepository;
   private paymentEventRepo: PaymentEventRepository;
   private orderRepo: OrderRepository;
+  private orderItemRepo: OrderItemRepository;
   private inventoryService: InventoryService;
 
   constructor(
     paymentRepo?: PaymentRepository,
     paymentEventRepo?: PaymentEventRepository,
     orderRepo?: OrderRepository,
-    _orderItemRepo?: OrderItemRepository, // kept so container wiring doesn't change; stock is now handled in the DB
+    orderItemRepo?: OrderItemRepository,
     inventoryService?: InventoryService
   ) {
     this.paymentRepo = paymentRepo || container.resolve<PaymentRepository>(RepositoryTokens.PaymentRepository);
     this.paymentEventRepo = paymentEventRepo || container.resolve<PaymentEventRepository>(RepositoryTokens.PaymentEventRepository);
     this.orderRepo = orderRepo || container.resolve<OrderRepository>(RepositoryTokens.OrderRepository);
+    this.orderItemRepo = orderItemRepo || container.resolve<OrderItemRepository>(RepositoryTokens.OrderItemRepository);
     this.inventoryService = inventoryService || container.resolve<InventoryService>(ServiceTokens.InventoryService);
   }
 
@@ -124,136 +112,50 @@ export class PaymentServiceImpl implements PaymentService {
     const secret = env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_KEY_SECRET;
 
     if (!secret) {
+      // Fail closed: without a secret we cannot verify the signature at all.
+      // Silently accepting the payment here would let anyone forge a "successful"
+      // payment callback, so we reject instead of trusting it.
       logger.error('[PaymentService.verifySignature] RAZORPAY_KEY_SECRET is not set — cannot verify payment signature, rejecting');
       return failure(new PaymentError('Payment verification is not configured (missing RAZORPAY_KEY_SECRET)'));
     }
 
     try {
-      const expected = this.computeHmacHex(secret, `${dto.razorpay_order_id}|${dto.razorpay_payment_id}`);
-      const isValid = this.safeEqual(expected, dto.razorpay_signature);
+      const isValid = this.computeHmacHex(secret, `${dto.razorpay_order_id}|${dto.razorpay_payment_id}`) === dto.razorpay_signature;
 
       if (!isValid) {
-        logger.warn(`[PaymentService.verifySignature] Signature mismatch for razorpay order ${dto.razorpay_order_id}`);
+        logger.warn(`[PaymentService.verifySignature] Signature mismatch for order ${dto.razorpay_order_id}`);
       }
 
       return success(isValid);
     } catch (err) {
+      // Fail closed on unexpected errors (e.g. malformed signature) rather than
+      // treating the payment as verified.
       logger.error('[PaymentService.verifySignature] Error while verifying signature', err);
       return failure(new PaymentError('Payment signature verification failed'));
     }
   }
 
-  /**
-   * THE single successful-payment path (used by both /payment/verify and the webhook).
-   *
-   * 1. Fetch the payment from Razorpay and confirm it is captured, in INR, on the right order, for the right amount.
-   * 2. Match it to our payment row.
-   * 3. Call confirm_windia_razorpay_payment_and_deduct_stock (status updates + stock deduction, one DB transaction).
-   *
-   * Nothing here writes payments.status / orders.payment_status directly.
-   *
-   * Result semantics:
-   *  - success(confirmed | already_processed): fine.
-   *  - success(rejected): a definite mismatch/not-captured; retrying will not help.
-   *  - failure: provider or RPC error; may be retried (webhook returns non-2xx so Razorpay retries).
-   */
-  public async confirmVerifiedRazorpayPayment(input: ConfirmPaymentInput): Promise<Result<ConfirmPaymentResult, AppError>> {
-    const { razorpayOrderId, razorpayPaymentId, expectedOrderId, source } = input;
-    const tag = `[PaymentService.confirm:${source}]`;
+  public async processSuccessfulPayment(
+    paymentId: string,
+    transactionId: string,
+    rawPayload?: Record<string, unknown>
+  ): Promise<Result<Payment, AppError>> {
+    logger.info(`[PaymentService.processSuccessfulPayment] Processing payment ${paymentId} success with transaction ${transactionId}`);
 
-    const payment = await this.findPaymentByProviderOrderId(razorpayOrderId);
-    if (!payment || !payment.order_id) {
-      logger.error(`${tag} No payment record for razorpay order ${razorpayOrderId} — needs reconciliation`);
-      return success({ outcome: 'rejected', reason: 'unknown_order' });
-    }
-    const orderId = payment.order_id;
-
-    if (expectedOrderId && expectedOrderId !== orderId) {
-      logger.warn(`${tag} Order id mismatch for razorpay order ${razorpayOrderId}`);
-      return success({ outcome: 'rejected', reason: 'order_mismatch' });
-    }
-
-    // Already confirmed by the other path (webhook vs verify) — nothing more to do.
-    if (payment.status === PaymentStatus.PAID) {
-      if (payment.transaction_id === razorpayPaymentId) {
-        return success({ outcome: 'already_processed', orderId });
-      }
-      logger.error(`${tag} Order ${orderId} already paid with a different payment id — manual review`);
-      return success({ outcome: 'rejected', reason: 'payment_id_mismatch' });
-    }
-
-    // Ask Razorpay directly; a frontend success callback alone is not proof.
-    let rp: any;
-    try {
-      rp = await getRazorpayClient().payments.fetch(razorpayPaymentId);
-    } catch (err: any) {
-      logger.error(`${tag} Could not fetch payment ${razorpayPaymentId} from Razorpay: ${err?.message || 'unknown error'}`);
-      return failure(new PaymentError('Could not verify payment with Razorpay'));
-    }
-
-    if (rp.order_id !== razorpayOrderId) {
-      logger.error(`${tag} Razorpay order id mismatch for payment ${razorpayPaymentId}`);
-      return success({ outcome: 'rejected', reason: 'provider_order_mismatch' });
-    }
-    if (rp.currency !== RAZORPAY_CURRENCY) {
-      logger.error(`${tag} Unexpected currency "${rp.currency}" for payment ${razorpayPaymentId}`);
-      return success({ outcome: 'rejected', reason: 'currency_mismatch' });
-    }
-    if (rp.status !== 'captured') {
-      logger.warn(`${tag} Payment ${razorpayPaymentId} not captured (status: ${rp.status})`);
-      return success({ outcome: 'rejected', reason: 'not_captured' });
-    }
-
-    // Compare in paise (integers) to avoid float issues, then convert to INR for the RPC.
-    const expectedPaise = Math.round(Number(payment.amount) * 100);
-    const capturedPaise = Number(rp.amount);
-    if (!Number.isFinite(capturedPaise) || capturedPaise !== expectedPaise) {
-      logger.error(`${tag} Amount mismatch for order ${orderId}: expected ${expectedPaise} paise, Razorpay ${capturedPaise}`);
-      return success({ outcome: 'rejected', reason: 'amount_mismatch' });
-    }
-    const amountInr = capturedPaise / 100;
-
-    const rpcRes = await this.inventoryService.confirmPaymentAndDeductStock({
-      orderId,
-      providerOrderId: razorpayOrderId,
-      transactionId: razorpayPaymentId,
-      amountInr,
+    const updateRes = await this.paymentRepo.update(paymentId, {
+      status: PaymentStatus.PAID,
+      transaction_id: transactionId,
+      raw_response: rawPayload || null,
     });
 
-    if (!rpcRes.success) {
-      // Race: the other path may have committed between our status check and the RPC.
-      const latest = await this.findPaymentByProviderOrderId(razorpayOrderId);
-      if (latest?.status === PaymentStatus.PAID && latest.transaction_id === razorpayPaymentId) {
-        return success({ outcome: 'already_processed', orderId });
-      }
+    if (!updateRes.success) return updateRes;
 
-      // Payment is captured but the DB rolled back (e.g. stock validation). Do NOT report fulfilled.
-      logger.error(
-        `${tag} Confirm+deduct RPC failed for order ${orderId} / payment ${razorpayPaymentId} — captured payment needs reconciliation: ${rpcRes.error.message}`
-      );
-      await this.logPaymentEvent(payment.id, PAYMENT_EVENT.RECONCILE, {
-        transaction_id: razorpayPaymentId,
-        provider_order_id: razorpayOrderId,
-        source,
-        reason: rpcRes.error.message,
-      });
-      return failure(rpcRes.error);
-    }
-
-    await this.logPaymentEvent(payment.id, PAYMENT_EVENT.SUCCEEDED, {
-      transaction_id: razorpayPaymentId,
-      provider_order_id: razorpayOrderId,
-      source,
+    await this.logPaymentEvent(paymentId, PAYMENT_EVENT.SUCCEEDED, {
+      transaction_id: transactionId,
+      payload: rawPayload,
     });
 
-    // Non-fatal: payment already succeeded; admin "Retry shipment" is the fallback. autoBookShipment is idempotent.
-    try {
-      await autoBookShipment(orderId, `[PaymentService.confirm:${source}]`);
-    } catch (err: any) {
-      logger.error(`${tag} Shipment booking failed for order ${orderId}: ${err?.message || 'unknown error'}`);
-    }
-
-    return success({ outcome: 'confirmed', orderId });
+    return success(updateRes.value);
   }
 
   public async processFailedPayment(
@@ -285,27 +187,31 @@ export class PaymentServiceImpl implements PaymentService {
   public async processRefund(orderId: string, reason?: string): Promise<Result<Payment, AppError>> {
     logger.info(`[PaymentService.processRefund] Processing refund for order ${orderId}`);
 
+    // Find the payment record
     const paymentRes = await this.paymentRepo.findByOrderId(orderId);
     if (!paymentRes.success || !paymentRes.value || paymentRes.value.length === 0) {
       return failure(new ValidationError('Payment record not found for this order'));
     }
 
-    const payment = paymentRes.value[0];
+    const payment = paymentRes.value[0]; // Get the first (should be only one)
 
+    // Check if already refunded
     if (payment.status === PaymentStatus.REFUNDED) {
       logger.info(`[PaymentService.processRefund] Payment ${payment.id} already refunded`);
       return success(payment);
     }
 
+    // Only refund if payment was successful
     if (payment.status !== PaymentStatus.PAID) {
       logger.warn(`[PaymentService.processRefund] Payment ${payment.id} is not in PAID status (current: ${payment.status}), skipping refund`);
       return success(payment);
     }
 
     try {
+      // Initiate Razorpay refund
       const razorpay = getRazorpayClient();
       const refundResponse = await razorpay.payments.refund(payment.transaction_id!, {
-        amount: Math.round(payment.amount * 100),
+        amount: Math.round(payment.amount * 100), // Full refund in paise
         notes: {
           reason: reason || 'Order cancelled by customer',
           order_id: orderId,
@@ -314,6 +220,7 @@ export class PaymentServiceImpl implements PaymentService {
 
       logger.info(`[PaymentService.processRefund] Razorpay refund created: ${refundResponse.id}`);
 
+      // Update payment status to REFUNDED
       const updateRes = await this.paymentRepo.update(payment.id, {
         status: PaymentStatus.REFUNDED,
         raw_response: {
@@ -326,6 +233,7 @@ export class PaymentServiceImpl implements PaymentService {
 
       if (!updateRes.success) return updateRes;
 
+      // Log refund event
       await this.logPaymentEvent(payment.id, 'payment.refunded', {
         refund_id: refundResponse.id,
         amount: payment.amount,
@@ -333,6 +241,7 @@ export class PaymentServiceImpl implements PaymentService {
         razorpay_response: refundResponse,
       });
 
+      // Update order payment_status to REFUNDED
       await this.orderRepo.update(orderId, {
         payment_status: PaymentStatus.REFUNDED,
       } as any);
@@ -341,7 +250,8 @@ export class PaymentServiceImpl implements PaymentService {
       return success(updateRes.value);
     } catch (error: any) {
       logger.error(`[PaymentService.processRefund] Razorpay refund failed for order ${orderId}:`, error);
-
+      
+      // Log the failure
       await this.logPaymentEvent(payment.id, 'payment.refund_failed', {
         error: error.message,
         reason: reason || 'Order cancelled by customer',
@@ -350,7 +260,6 @@ export class PaymentServiceImpl implements PaymentService {
       return failure(new PaymentError(`Refund failed: ${error.message || 'Unknown error'}`));
     }
   }
-
   public async logPaymentEvent(
     paymentId: string,
     eventType: string,
@@ -361,6 +270,8 @@ export class PaymentServiceImpl implements PaymentService {
       const payment = paymentRes.success ? paymentRes.value : null;
       const eventStatus = this.resolveEventStatus(eventType);
 
+      // The live payment_events table stores order/payment provider IDs and
+      // raw_payload, rather than the newer payment_id/payload names.
       return await this.paymentEventRepo.create({
         order_id: payment?.order_id || null,
         razorpay_order_id: payment?.provider_order_id || payload.provider_order_id || payload.razorpay_order_id || null,
@@ -375,81 +286,49 @@ export class PaymentServiceImpl implements PaymentService {
     }
   }
 
-  /**
-   * @param rawBody  exact request body string (signature is computed over these bytes)
-   * @param eventId  value of the x-razorpay-event-id header, when present
-   */
-  public async handleWebhook(rawBody: string, signature: string, eventId?: string | null): Promise<Result<boolean, AppError>> {
+  public async handleWebhook(payload: Record<string, unknown>, signature: string): Promise<Result<boolean, AppError>> {
     logger.info('[PaymentService.handleWebhook] Webhook received from Razorpay');
 
     if (!signature) {
       return failure(new ValidationError('Missing webhook signature'));
     }
 
-    // Verify BEFORE parsing; fails closed when the secret is missing.
-    const signatureCheck = this.verifyWebhookSignature(rawBody, signature);
+    const signatureCheck = await this.verifyWebhookSignature(payload, signature);
     if (!signatureCheck.success) return signatureCheck;
 
-    let payload: Record<string, any>;
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      return failure(new ValidationError('Invalid webhook payload'));
-    }
-
     const event = (payload.event as string) || 'payment.event';
+    const eventId = (payload.event_id || payload.id || `evt_${Date.now()}`) as string;
 
-    // Best-effort dedupe on the real Razorpay event id. The hard guarantee against
-    // double deduction is the DB RPC + unique indexes, not this check.
-    if (eventId && (await this.isDuplicateWebhookEvent(event, eventId))) {
-      logger.info(`[PaymentService.handleWebhook] Duplicate webhook event ${eventId} ignored`);
+    if (await this.isDuplicateWebhookEvent(event, eventId)) {
+      logger.info(`[PaymentService.handleWebhook] Duplicate webhook event ${eventId} ignored (idempotent)`);
       return success(true);
     }
 
-    const paymentEntity = payload.payload?.payment?.entity;
+    const paymentEntity = (payload.payload as any)?.payment?.entity;
     if (!paymentEntity) {
-      logger.info(`[PaymentService.handleWebhook] No payment entity in "${event}" webhook — ignoring`);
+      logger.warn('[PaymentService.handleWebhook] No payment entity in webhook payload');
+      // Log the event and return success (don't fail on non-payment webhooks)
       return success(true);
     }
 
-    const razorpayOrderId = paymentEntity.order_id as string | undefined;
-    const razorpayPaymentId = paymentEntity.id as string | undefined;
+    const razorpayOrderId = paymentEntity.order_id as string;
+    const razorpayPaymentId = paymentEntity.id as string;
     const paymentRecord = razorpayOrderId ? await this.findPaymentByProviderOrderId(razorpayOrderId) : null;
 
     if (event === WEBHOOK_EVENT.PAYMENT_CAPTURED || event === WEBHOOK_EVENT.ORDER_PAID) {
-      if (!razorpayOrderId || !razorpayPaymentId) {
-        logger.warn('[PaymentService.handleWebhook] Captured event without order/payment id — ignoring');
-        return success(true);
-      }
-
-      const confirmRes = await this.confirmVerifiedRazorpayPayment({
-        razorpayOrderId,
-        razorpayPaymentId,
-        source: 'webhook',
-      });
-
-      // failure => non-2xx so Razorpay retries (handler is idempotent).
-      if (!confirmRes.success) return failure(confirmRes.error);
-
-      if (confirmRes.value.outcome === 'rejected') {
-        // Definite mismatch — retrying won't help. Logged inside confirm; ack so Razorpay stops retrying.
-        logger.error(`[PaymentService.handleWebhook] Payment ${razorpayPaymentId} rejected: ${confirmRes.value.reason}`);
-      }
+      await this.handlePaymentCapturedEvent(paymentRecord, razorpayOrderId, razorpayPaymentId, paymentEntity);
     } else if (event === WEBHOOK_EVENT.PAYMENT_FAILED) {
-      // Log only. Razorpay lets a customer retry on the same order after a failed attempt,
-      // so a failed attempt must not permanently mark the payment row failed.
-      logger.info(`[PaymentService.handleWebhook] payment.failed received for razorpay order ${razorpayOrderId}`);
+      if (paymentRecord && paymentRecord.status !== 'paid') {
+        await this.processFailedPayment(paymentRecord.id, paymentEntity.error_description || 'Payment failed via webhook', paymentEntity);
+      }
     }
 
-    // Record the event (ids/status only — no customer data) so the event id is traceable.
     if (paymentRecord) {
       await this.logPaymentEvent(paymentRecord.id, event, {
-        event_id: eventId || null,
+        event_id: eventId,
         razorpay_payment_id: razorpayPaymentId,
         razorpay_order_id: razorpayOrderId,
-        payment_status: paymentEntity.status,
-        amount: paymentEntity.amount,
-        currency: paymentEntity.currency,
+        webhook_payload: paymentEntity,
       });
     }
 
@@ -479,31 +358,36 @@ export class PaymentServiceImpl implements PaymentService {
     return createHmac('sha256', secret).update(text).digest('hex');
   }
 
-  private safeEqual(a: string, b: string): boolean {
-    const bufA = Buffer.from(a);
-    const bufB = Buffer.from(b);
-    if (bufA.length !== bufB.length) return false;
-    return timingSafeEqual(bufA, bufB);
-  }
-
   private resolveEventStatus(eventType: string): 'failed' | 'success' | 'pending' {
-    if (eventType.includes('failed') || eventType.includes('reconcile')) return 'failed';
+    if (eventType.includes('failed')) return 'failed';
     if (eventType.includes('succeeded')) return 'success';
     return 'pending';
   }
 
   /**
-   * Webhook signature over the exact raw body. Fails closed if the secret is missing/placeholder.
+   * Verifies the Razorpay webhook signature against RAZORPAY_WEBHOOK_SECRET (when configured).
+   * Uses a timing-safe comparison to avoid leaking signature validity via timing.
+   * SECURITY: Rejects webhooks if secret is not configured or is a placeholder.
    */
-  private verifyWebhookSignature(rawBody: string, signature: string): Result<true, AppError> {
+  private async verifyWebhookSignature(payload: Record<string, unknown>, signature: string): Promise<Result<true, AppError>> {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
     if (!webhookSecret || webhookSecret.startsWith('REPLACE_ME')) {
-      logger.error('[PaymentService.handleWebhook] RAZORPAY_WEBHOOK_SECRET is not configured — rejecting webhook');
-      return failure(new PaymentError('Webhook verification is not configured'));
+      logger.error('[PaymentService.handleWebhook] RAZORPAY_WEBHOOK_SECRET not configured - rejecting webhook for security');
+      return failure(new ValidationError('Webhook signature verification not configured - webhook rejected'));
     }
 
-    const expected = this.computeHmacHex(webhookSecret, rawBody);
-    if (!this.safeEqual(expected, signature)) {
+    const rawBody = JSON.stringify(payload);
+    const expectedSignature = this.computeHmacHex(webhookSecret, rawBody);
+
+    const sigBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (sigBuffer.length !== expectedBuffer.length) {
+      logger.warn('[PaymentService.handleWebhook] Webhook signature length mismatch — rejecting');
+      return failure(new ValidationError('Invalid webhook signature'));
+    }
+
+    if (!timingSafeEqual(sigBuffer, expectedBuffer)) {
       logger.warn('[PaymentService.handleWebhook] Webhook signature mismatch — rejecting');
       return failure(new ValidationError('Invalid webhook signature'));
     }
@@ -516,13 +400,71 @@ export class PaymentServiceImpl implements PaymentService {
     if (!existingEventsRes.success) return false;
 
     return existingEventsRes.value.some((e) => {
-      const p = (e as any).raw_payload || (e as any).payload;
-      return p && (p as any).event_id === eventId;
+      const p = (e as any).raw_payload || e.payload;
+      return p && ((p as any).event_id === eventId || (p as any).id === eventId);
     });
   }
 
   private async findPaymentByProviderOrderId(razorpayOrderId: string): Promise<Payment | null> {
     const lookupRes = await this.paymentRepo.findByProviderOrderId(razorpayOrderId);
     return lookupRes.success && lookupRes.value ? lookupRes.value : null;
+  }
+
+  private async handlePaymentCapturedEvent(
+    paymentRecord: Payment | null,
+    razorpayOrderId: string,
+    razorpayPaymentId: string,
+    paymentEntity: any
+  ): Promise<void> {
+    if (!paymentRecord) {
+      logger.warn(`[PaymentService.handleWebhook] No payment record found for Razorpay order ${razorpayOrderId} — needs reconciliation`);
+      return;
+    }
+
+    // Only process if not already paid (prevents double-processing)
+    if (paymentRecord.status === 'paid') {
+      logger.info(`[PaymentService.handleWebhook] Payment ${paymentRecord.id} already marked paid — skipping`);
+      return;
+    }
+
+    const orderId = paymentRecord.order_id;
+    if (!orderId) {
+      logger.warn(`[PaymentService.handleWebhook] Payment ${paymentRecord.id} has no order_id — cannot process`);
+      return;
+    }
+
+    // Get order details for amount validation
+    const orderRes = await this.orderRepo.findById(orderId);
+    if (!orderRes.success || !orderRes.value) {
+      logger.error(`[PaymentService.handleWebhook] Order ${orderId} not found for payment ${paymentRecord.id}`);
+      return;
+    }
+
+    // Use the new atomic RPC that confirms payment + deducts stock in one transaction
+    // This replaces the old pattern of separate processSuccessfulPayment + orderRepo.update + deductStockForOrder
+    const confirmRes = await this.inventoryService.confirmPaymentAndDeductStock({
+      orderId,
+      providerOrderId: razorpayOrderId,
+      transactionId: razorpayPaymentId,
+      amountInr: orderRes.value.total_price,
+    });
+
+    if (!confirmRes.success) {
+      logger.error(
+        `[PaymentService.handleWebhook] confirmPaymentAndDeductStock failed for order ${orderId}: ${confirmRes.error.message}`
+      );
+      // Still update payment record for reconciliation
+      await this.processSuccessfulPayment(paymentRecord.id, razorpayPaymentId, paymentEntity);
+      return;
+    }
+
+    logger.info(`[PaymentService.handleWebhook] ✅ Payment confirmed and stock deducted for order ${orderId}`);
+
+    // Payment confirmed via webhook (may arrive before or instead of the
+    // client-side verify call, e.g. if the user closed their browser) —
+    // book the DTDC shipment automatically here too. autoBookShipment
+    // is idempotent (checks order.tracking_number first), so this is safe even if
+    // payment/verify already booked it.
+    await autoBookShipment(orderId, '[PaymentService.handleWebhook]');
   }
 }

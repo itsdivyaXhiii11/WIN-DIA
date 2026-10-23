@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server';
-import { container, ServiceTokens } from '@/src/backend/providers/container.provider';
+import { container, ServiceTokens, RepositoryTokens } from '@/src/backend/providers/container.provider';
 import { PaymentService } from '@/src/backend/services/payment.service';
+import { OrderService } from '@/src/backend/services/order.service';
+import { InventoryService } from '@/src/backend/services/inventory.service';
+import { PaymentRepository } from '@/src/backend/repositories/payment.repository';
+import { OrderItemRepository } from '@/src/backend/repositories/order-item.repository';
 import { getAuthUserContext, handleServiceResult } from '@/src/backend/utils/route-helper.util';
 import { createErrorResponse } from '@/src/backend/types/api-response.types';
-import { logger } from '@/src/backend/utils/logger.util';
+import { autoBookShipment } from '@/src/backend/services/auto-shipment.util';
 
 export const runtime = 'nodejs';
 
@@ -17,13 +21,7 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => ({}));
     const { orderId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = body;
 
-    if (
-      typeof orderId !== 'string' ||
-      typeof razorpay_order_id !== 'string' ||
-      typeof razorpay_payment_id !== 'string' ||
-      typeof razorpay_signature !== 'string' ||
-      !orderId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature
-    ) {
+    if (!orderId || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return NextResponse.json(
         createErrorResponse('VALIDATION_ERROR', 'Missing payment verification fields'),
         { status: 400 }
@@ -31,62 +29,106 @@ export async function POST(request: Request) {
     }
 
     const paymentService = container.resolve<PaymentService>(ServiceTokens.PaymentService);
+    const orderService = container.resolve<OrderService>(ServiceTokens.OrderService);
+    const inventoryService = container.resolve<InventoryService>(ServiceTokens.InventoryService);
+    const paymentRepo = container.resolve<PaymentRepository>(RepositoryTokens.PaymentRepository);
+    const orderItemRepo = container.resolve<OrderItemRepository>(RepositoryTokens.OrderItemRepository);
 
-    // 1. Checkout signature (server-side, fail closed).
-    // A bad signature does NOT mark the payment failed: this endpoint is
-    // callable by anyone, so it must never be able to flip a real payment's status.
+    // Lookup the Payment row by provider_order_id (razorpay_order_id) to obtain payment.id.
+    // The route previously passed orderId to processSuccessfulPayment/processFailedPayment
+    // but those methods call paymentRepo.update(paymentId, ...) — an orders UUID never
+    // matches a payments.id row, so the payment record was never updated.
+    const paymentLookupRes = await paymentRepo.findByProviderOrderId(razorpay_order_id);
+    if (!paymentLookupRes.success) {
+      return NextResponse.json(
+        createErrorResponse('INTERNAL_SERVER_ERROR', 'Failed to retrieve payment record'),
+        { status: 500 }
+      );
+    }
+    if (!paymentLookupRes.value) {
+      return NextResponse.json(
+        createErrorResponse('PAYMENT_ERROR', `No payment record found for Razorpay order ${razorpay_order_id}`),
+        { status: 404 }
+      );
+    }
+    const paymentId = paymentLookupRes.value.id;
+
     const verifyRes = await paymentService.verifySignature({
       orderId,
       razorpay_order_id,
       razorpay_payment_id,
       razorpay_signature,
     });
-    if (!verifyRes.success) return handleServiceResult(verifyRes);
-    if (!verifyRes.value) {
-      logger.warn(`[payment/verify] Invalid signature for razorpay order ${razorpay_order_id}`);
+
+    if (!verifyRes.success || !verifyRes.value) {
+      await paymentService.processFailedPayment(paymentId, 'Signature verification failed', body);
       return NextResponse.json(
         createErrorResponse('PAYMENT_ERROR', 'Payment verification failed'),
         { status: 400 }
       );
     }
 
-    // 2. Provider check + DB match + atomic confirm-and-deduct (single path shared with webhook)
-    const confirmRes = await paymentService.confirmVerifiedRazorpayPayment({
-      razorpayOrderId: razorpay_order_id,
-      razorpayPaymentId: razorpay_payment_id,
-      expectedOrderId: orderId,
-      source: 'verify',
-    });
+    // Process payment success & update order status
+    // Check if payment was already processed (e.g., by the webhook arriving first).
+    // If already paid, the webhook already deducted stock — skip to avoid double-deduction.
+    const existingPayment = paymentLookupRes.value;
+    if (existingPayment.status === 'paid') {
+      // Payment already processed by webhook — just return success without re-deducting stock
+      return NextResponse.json({
+        success: true,
+        verified: true,
+        orderId,
+        note: 'Payment was already processed by webhook',
+      });
+    }
 
-    if (!confirmRes.success) {
-      // Payment may be captured but not yet confirmed (provider/RPC error). Details are logged server-side.
+    // Use the new single-transaction RPC that confirms payment AND deducts stock atomically.
+    // This replaces the old pattern of processSuccessfulPayment + markOrderPaid + individual deductions.
+    const orderRes = await orderService.getOrderById(orderId);
+    if (!orderRes.success || !orderRes.value) {
       return NextResponse.json(
-        createErrorResponse(
-          'PAYMENT_ERROR',
-          'We could not confirm your order yet. If you were charged, please contact support with your order ID.'
-        ),
+        createErrorResponse('INTERNAL_SERVER_ERROR', 'Order not found after signature verification'),
         { status: 500 }
       );
     }
 
-    const result = confirmRes.value;
-    if (result.outcome === 'rejected') {
-      return NextResponse.json(
-        createErrorResponse('PAYMENT_ERROR', 'Payment could not be verified'),
-        { status: result.reason === 'not_captured' ? 409 : 400 }
-      );
+    const confirmRes = await inventoryService.confirmPaymentAndDeductStock({
+      orderId,
+      providerOrderId: razorpay_order_id,
+      transactionId: razorpay_payment_id,
+      amountInr: orderRes.value.total_price,
+    });
+
+    if (!confirmRes.success) {
+      // Stock deduction failed — log but don't fail the response since payment is confirmed
+      console.error('[payment/verify] confirmPaymentAndDeductStock failed:', confirmRes.error.message);
+      
+      // Still mark payment successful (payment was verified with Razorpay)
+      await paymentService.processSuccessfulPayment(paymentId, razorpay_payment_id, body);
+      await orderService.markOrderPaid(orderId, 'Payment verified but stock deduction failed - manual reconciliation needed', authRes.value.id);
+      
+      return NextResponse.json({
+        success: true,
+        verified: true,
+        orderId,
+        warning: 'Payment confirmed but stock deduction failed - order requires manual reconciliation',
+      });
     }
+
+    // Payment is confirmed — book the DTDC shipment automatically.
+    // Non-fatal: the customer's payment already succeeded, so a shipping
+    // booking hiccup must not fail this response. If it fails, the admin's
+    // "Retry shipment" button (app/admin/orders) is the manual fallback.
+    await autoBookShipment(orderId, '[payment/verify]');
 
     return NextResponse.json({
       success: true,
       verified: true,
       orderId,
-      ...(result.outcome === 'already_processed' ? { note: 'Payment was already processed' } : {}),
     });
   } catch (err: any) {
-    logger.error('[payment/verify] Unexpected error', err);
     return NextResponse.json(
-      createErrorResponse('INTERNAL_SERVER_ERROR', 'An unexpected error occurred'),
+      createErrorResponse('INTERNAL_SERVER_ERROR', err.message || 'An unexpected error occurred'),
       { status: 500 }
     );
   }

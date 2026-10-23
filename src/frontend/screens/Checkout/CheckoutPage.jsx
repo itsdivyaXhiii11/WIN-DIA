@@ -27,24 +27,13 @@ function loadRazorpay() {
   });
 }
 
-// Safe JSON reader: returns null instead of throwing when the body is empty or not JSON
-async function readJson(res) {
-  try {
-    const text = await res.text();
-    if (!text) return null;
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
 const STATES = ["Karnataka","Tamil Nadu","Kerala","Maharashtra","Delhi","Gujarat","Rajasthan","Uttar Pradesh","West Bengal","Telangana","Andhra Pradesh","Madhya Pradesh","Bihar","Punjab","Haryana","Odisha","Assam","Other"];
 
 export default function CheckoutPage() {
   const dispatch = useDispatch();
   const router = useRouter();
   const { cartItems, buyNowItem, promoApplied, promoCode } = useSelector((s) => s.cart);
-  const { user, authFetch, token } = useAuth();
+  const { user, authFetch } = useAuth();
 
   // If buyNowItem is set, checkout only that single item; otherwise use full cart
   const checkoutItems = buyNowItem ? [buyNowItem] : cartItems;
@@ -62,50 +51,6 @@ export default function CheckoutPage() {
   const [couponLoading, setCouponLoading] = useState(false);
 
   const [form, setForm] = useState({ type: "home", name: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
-
-  // Helper function to calculate bundle price
-  const getBundlePrice = (bundles) => {
-    if (bundles === 1) return 384;
-    if (bundles === 2) return 640;
-    if (bundles === 3) return 896;
-    if (bundles === 4) return 1152;
-    if (bundles === 5) return 1408;
-    if (bundles >= 6) return 1664 + ((bundles - 6) * 256);
-    return 0;
-  };
-
-  // Helper function to calculate paid vs free packets
-  const getPacketBreakdown = (bundles) => {
-    if (bundles === 1) return { total: 6, paid: 6, free: 0 };
-    if (bundles === 2) return { total: 12, paid: 10, free: 2 };
-    if (bundles === 3) return { total: 18, paid: 14, free: 4 };
-    if (bundles === 4) return { total: 24, paid: 18, free: 6 };
-    if (bundles === 5) return { total: 30, paid: 22, free: 8 };
-    if (bundles >= 6) {
-      const extraBundles = bundles - 6;
-      return { 
-        total: 36 + (extraBundles * 6), 
-        paid: 26 + (extraBundles * 4), 
-        free: 10 + (extraBundles * 2) 
-      };
-    }
-    return { total: 0, paid: 0, free: 0 };
-  };
-
-  // Calculate totals
-  const totalBundles = checkoutItems.reduce((sum, item) => sum + (item.qty || 0), 0);
-  const subtotal = getBundlePrice(totalBundles);
-  const discount = couponApplied ? subtotal * 0.1 : 0;
-  const shipping = 0; // FREE DELIVERY — always ₹0, enforced server-side
-  const total = subtotal - discount + shipping;
-
-  // Calculate packet breakdown (paid vs free)
-  const packetBreakdown = getPacketBreakdown(totalBundles);
-
-  // Calculate total packets for validation (6-multiple check)
-  const totalPackets = checkoutItems.reduce((sum, item) => sum + (item.qty * 6), 0);
-  const isMultipleOfSix = totalPackets % 6 === 0;
-  const remainderPackets = totalPackets % 6;
 
   // Handle coupon application
   const handleApplyCoupon = async () => {
@@ -125,15 +70,15 @@ export default function CheckoutPage() {
         }),
       });
       
-      const data = await readJson(res);
+      const data = await res.json();
       
-      if (data && data.success) {
+      if (data.success) {
         setCouponApplied(true);
-        dispatch(setPromoApplied(true));
-        dispatch(setPromoCode(couponCode.trim()));
+        dispatch(setPromoApplied(true)); // Save to Redux
+        dispatch(setPromoCode(couponCode.trim())); // Save code to Redux
         toast.success(`Coupon applied! You saved ₹${data.data.discount_amount.toFixed(0)}`);
       } else {
-        toast.error((data && data.error) || "Invalid coupon code");
+        toast.error(data.error || "Invalid coupon code");
       }
     } catch (error) {
       toast.error("Failed to apply coupon");
@@ -145,8 +90,8 @@ export default function CheckoutPage() {
   const handleRemoveCoupon = () => {
     setCouponApplied(false);
     setCouponCode("");
-    dispatch(setPromoApplied(false));
-    dispatch(setPromoCode(""));
+    dispatch(setPromoApplied(false)); // Clear from Redux
+    dispatch(setPromoCode("")); // Clear code from Redux
     toast.success("Coupon removed");
   };
 
@@ -169,14 +114,7 @@ export default function CheckoutPage() {
     localStorage.removeItem(LOCAL_ADDRESS_KEY);
     setAddresses([]);
     setSelectedAddr(null);
-    authFetch("/api/addresses").then(async (r) => {
-      const d = await readJson(r);
-      if (!r.ok || !d) {
-        console.error("Load addresses failed:", r.status, d);
-        // Same toast id so it never shows up twice
-        toast.error("Could not load addresses", { id: "load-addresses" });
-        return;
-      }
+    authFetch("/api/addresses").then((r) => r.json()).then((d) => {
       const rawAddresses = d.addresses || d.data || [];
       if (rawAddresses.length > 0) {
         const normalized = rawAddresses.map((a) => ({
@@ -195,11 +133,8 @@ export default function CheckoutPage() {
         const def = normalized.find((a) => a.isDefault) || normalized[0];
         if (def) setSelectedAddr(def._id);
       }
-    }).catch((err) => {
-      console.error("Load addresses error:", err);
-      toast.error("Could not load addresses", { id: "load-addresses" });
-    });
-  }, [user, authFetch]);
+    }).catch(() => toast.error("Could not load addresses"));
+  }, [user]);
 
   const saveLocalAddress = () => {
     const localId = `local-${Date.now()}`;
@@ -219,15 +154,33 @@ export default function CheckoutPage() {
     return saved;
   };
 
+  // Calculations — SERVER-SIDE is the source of truth, this is display only
+  // IMPORTANT: Cart items may have per-bundle prices from the product catalog.
+  // However, we need to apply tiered pricing across ALL bundles in the order.
+  // The server independently recalculates using tiered pricing, so this is for preview.
+  
+  // Calculate total bundles in order for tiered pricing
+  const totalBundles = checkoutItems.reduce((sum, i) => sum + i.qty, 0);
+  
+  // For display purposes, calculate what the server will charge using tiered pricing
+  // Formula: total = 384 + (N - 1) × 256
+  const tieredTotal = 384 + (Math.max(1, totalBundles) - 1) * 256;
+  
+  const subtotal = tieredTotal;
+  const discount = couponApplied ? subtotal * 0.1 : 0;
+  const shipping = 0; // FREE DELIVERY — always ₹0, enforced server-side
+  // GST is deactivated: no separate tax line is added. Price shown already
+  // includes GST rather than adding it on top — see bundle-pricing.constants.ts.
+  const total = subtotal - discount + shipping;
+
   const handleSaveAddress = async () => {
     const errors = validateAddress(form);
     setFormErrors(errors);
     if (Object.keys(errors).length > 0) { toast.error("Please fix the form errors"); return; }
 
-    // If not authenticated, save to localStorage only
-    if (!user || !token) {
+    if (!user) {
       saveLocalAddress();
-      toast.success("Address saved locally. Please login to save permanently.");
+      toast.success("Address saved. Login before placing order.");
       return;
     }
 
@@ -245,15 +198,12 @@ export default function CheckoutPage() {
           is_default: form.isDefault,
         }),
       });
-
-      const data = await readJson(res);
-
-      if (!res.ok || !data || data.error || !data.address) {
-        console.error("Address save failed:", res.status, data);
-        toast.error((data && data.error) || `Could not save address (status ${res.status})`);
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        // Real save failure — tell the user, don't silently pretend it worked.
+        toast.error(data.error || "Could not save address. Please try again.");
         return;
       }
-
       const addr = data.address;
       const saved = {
         ...addr,
@@ -273,32 +223,13 @@ export default function CheckoutPage() {
       setForm({ type: "home", name: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
       setFormErrors({});
       toast.success("Address saved!");
-    } catch (err) {
-      console.error("Address save error:", err);
-      // If authentication error, save locally as fallback
-      if (err.message === 'Not authenticated') {
-        saveLocalAddress();
-        toast.success("Address saved locally. Please login to save permanently.");
-      } else {
-        toast.error("Could not save address. Please check your connection and try again.");
-      }
+    } catch {
+      toast.error("Could not save address. Please check your connection and try again.");
     }
   };
 
   const handlePlaceOrder = async () => {
     if (placing) return;
-    
-    // Block if not 6-multiple
-    if (!isMultipleOfSix) {
-      const remainderPackets = totalPackets % 6;
-      if (remainderPackets < 3) {
-        toast.error(`Remove ${remainderPackets} packet${remainderPackets > 1 ? 's' : ''} or add ${6 - remainderPackets} more to proceed (orders must be 6-packet multiples)`);
-      } else {
-        toast.error(`Add ${6 - remainderPackets} more packet${6 - remainderPackets > 1 ? 's' : ''} or remove ${remainderPackets} to proceed (orders must be 6-packet multiples)`);
-      }
-      return;
-    }
-    
     if (!user) {
       toast.error("Please login before placing the order");
       router.push("/login?next=/checkout");
@@ -322,16 +253,14 @@ export default function CheckoutPage() {
             qty: i.qty,
             flavor: i.flavor,
             netWeight: i.netWeight,
-            // Include flavor selections for combo products
-            ...(i.flavorSelections && { flavorSelections: i.flavorSelections }),
           })),
           shippingAddress: { name: addr.name || addr.full_name, phone: addr.phone, street: addr.street || addr.address_line1, city: addr.city, state: addr.state, pincode: addr.pincode },
           paymentMethod: payMethod, orderNotes: notes,
           couponCode: couponApplied ? couponCode : null,
         }),
       });
-      const data = await readJson(res);
-      if (!data || !data.success) { toast.error((data && data.error) || "Could not place order"); setPlacing(false); return; }
+      const data = await res.json();
+      if (!data.success) { toast.error(data.error || "Could not place order"); setPlacing(false); return; }
 
       if (!data.requiresPayment) {
         dispatch(clearBuyNowItem());
@@ -359,9 +288,9 @@ export default function CheckoutPage() {
               method: "POST",
               body: JSON.stringify({ orderId: data.order.id, razorpay_order_id: response.razorpay_order_id, razorpay_payment_id: response.razorpay_payment_id, razorpay_signature: response.razorpay_signature }),
             });
-            const vData = await readJson(vRes);
-            if (vData && vData.success) { dispatch(clearBuyNowItem()); dispatch(clearCart()); toast.success("Payment successful!"); router.push(`/order-confirmation?orderId=${data.order.id}`); }
-            else toast.error((vData && vData.error) || "Payment verification failed");
+            const vData = await vRes.json();
+            if (vData.success) { dispatch(clearBuyNowItem()); dispatch(clearCart()); toast.success("Payment successful!"); router.push(`/order-confirmation?orderId=${data.order.id}`); }
+            else toast.error(vData.error || "Payment verification failed");
           } finally { setPlacing(false); }
         },
         modal: {
@@ -414,26 +343,6 @@ export default function CheckoutPage() {
   return (
     <div className={styles.page}>
 
-      {/* ── 6-Multiple Validation Banner ── */}
-      {!isMultipleOfSix && (
-        <div style={{
-          backgroundColor: '#fff3cd',
-          borderBottom: '2px solid #ffc107',
-          padding: '16px',
-          textAlign: 'center',
-          color: '#856404',
-          fontWeight: 600,
-          fontSize: '15px'
-        }}>
-          ⚠️ Orders must be in multiples of 6 packets. 
-          {remainderPackets < 3 ? (
-            <span> Please remove <strong>{remainderPackets} packet{remainderPackets > 1 ? 's' : ''}</strong> or add <strong>{6 - remainderPackets} more packet{6 - remainderPackets > 1 ? 's' : ''}</strong> to proceed with payment.</span>
-          ) : (
-            <span> Please add <strong>{6 - remainderPackets} more packet{6 - remainderPackets > 1 ? 's' : ''}</strong> or remove <strong>{remainderPackets} packet{remainderPackets > 1 ? 's' : ''}</strong> to proceed with payment.</span>
-          )}
-        </div>
-      )}
-
       {/* ── Header ── */}
       <div className={styles.header}>
         <div className="container">
@@ -442,7 +351,7 @@ export default function CheckoutPage() {
 
           {/* Steps */}
           <div className={styles.steps}>
-            {["Shipping", "Review", "Payment"].map((label, i) => (
+            {["Delivery Details", "Review", "Payment"].map((label, i) => (
               <div key={label} className={styles.stepGroup}>
                 <div className={`${styles.step} ${step > i + 1 ? styles.stepDone : ""} ${step === i + 1 ? styles.stepActive : ""}`}>
                   <span>{step > i + 1 ? <FiCheck /> : i + 1}</span>
@@ -619,12 +528,7 @@ export default function CheckoutPage() {
                   </div>
                   <div className={styles.stepFooter}>
                     <button className={styles.backBtn2} onClick={() => setStep(1)}><FiArrowLeft /> Back</button>
-                    <button 
-                      className={styles.proceedBtn} 
-                      onClick={handlePlaceOrder} 
-                      disabled={placing || !isMultipleOfSix}
-                      style={!isMultipleOfSix ? { opacity: 0.5, cursor: 'not-allowed' } : {}}
-                    >
+                    <button className={styles.proceedBtn} onClick={handlePlaceOrder} disabled={placing}>
                       {placing ? <><FiLoader className="spin" /> Placing Order...</> : <>Place Order <FiChevronRight /></>}
                     </button>
                   </div>
@@ -641,44 +545,13 @@ export default function CheckoutPage() {
 
               <div className={styles.summaryItems}>
                 {checkoutItems.map((item) => (
-                  <div key={item.cartId || item._id || item.id} className={styles.summaryItem}>
+                  <div key={item._id || item.id} className={styles.summaryItem}>
                     <img src={item.image || "/images/product-methi.jpg"} alt={item.name} />
-                    <div style={{ flex: 1 }}>
+                    <div>
                       <p className={styles.sItemName}>{item.name}</p>
-                      <p className={styles.sItemQty}>× {item.qty}</p>
-                      
-                      {/* Combo Flavor Breakdown */}
-                      {item.flavorSelections && (
-                        <div style={{ 
-                          background: 'rgba(201,168,76,0.08)', 
-                          border: '1px solid rgba(201,168,76,0.25)', 
-                          borderRadius: '4px', 
-                          padding: '6px 8px', 
-                          marginTop: '6px',
-                          fontSize: '0.7rem'
-                        }}>
-                          <p style={{ fontWeight: 700, marginBottom: '4px', color: '#3B1F0F' }}>📦 Combo Contents:</p>
-                          <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                            {Object.entries(item.flavorSelections)
-                              .filter(([_, count]) => count > 0)
-                              .map(([flavorId, count]) => {
-                                const flavorNames = {
-                                  'curry-leaves': 'Curry Leaves',
-                                  'garlic': 'Garlic',
-                                  'jeera': 'Jeera',
-                                  'onion': 'Onion'
-                                };
-                                return (
-                                  <li key={flavorId} style={{ color: '#6B5948' }}>
-                                    <strong style={{ color: '#3B1F0F' }}>{flavorNames[flavorId]}</strong>: {count} × 40g
-                                  </li>
-                                );
-                              })}
-                          </ul>
-                        </div>
-                      )}
+                      <p className={styles.sItemQty}>× {item.qty} {item.qty === 1 ? 'bundle' : 'bundles'}</p>
                     </div>
-                    <span className={styles.sItemPrice}>₹{(item.price * item.qty).toFixed(0)}</span>
+                    <span className={styles.sItemPrice}>{item.qty} × 6 packets</span>
                   </div>
                 ))}
               </div>
@@ -746,56 +619,13 @@ export default function CheckoutPage() {
               </div>
 
               <div className={styles.breakdown}>
-                <div className={styles.bRow}><span>Subtotal</span><span>₹{subtotal.toFixed(2)}</span></div>
+                <div className={styles.bRow}>
+                  <span>{totalBundles} {totalBundles === 1 ? 'Bundle' : 'Bundles'} × 6 packets each</span>
+                  <span>₹{subtotal.toFixed(0)}</span>
+                </div>
                 {couponApplied && <div className={`${styles.bRow} ${styles.bDiscount}`}><span>Discount (10%)</span><span>−₹{discount.toFixed(2)}</span></div>}
                 <div className={styles.bRow}><span>Shipping</span><span className={styles.free}>FREE</span></div>
               </div>
-
-              {/* Packet Breakdown - Show paid vs free packets */}
-              {totalBundles > 0 && (
-                <div style={{
-                  background: 'linear-gradient(135deg, rgba(201,168,76,0.08) 0%, rgba(201,168,76,0.03) 100%)',
-                  border: '1px solid rgba(201,168,76,0.2)',
-                  borderRadius: '8px',
-                  padding: '12px 16px',
-                  marginBottom: '16px',
-                  fontSize: '0.9rem'
-                }}>
-                  <div style={{ 
-                    display: 'flex', 
-                    alignItems: 'center', 
-                    gap: '8px',
-                    marginBottom: '8px',
-                    fontWeight: 600,
-                    color: '#3B1F0F'
-                  }}>
-                    <FiPackage style={{ color: '#C9A84C' }} />
-                    <span>Your Order Breakdown</span>
-                  </div>
-                  <div style={{ 
-                    display: 'flex', 
-                    flexDirection: 'column', 
-                    gap: '4px',
-                    fontSize: '0.85rem',
-                    color: '#6B5948'
-                  }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span>Total packets:</span>
-                      <strong style={{ color: '#3B1F0F' }}>{packetBreakdown.total} packets ({totalBundles} bundle{totalBundles > 1 ? 's' : ''})</strong>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span>You pay for:</span>
-                      <strong style={{ color: '#3B1F0F' }}>{packetBreakdown.paid} packets</strong>
-                    </div>
-                    {packetBreakdown.free > 0 && (
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Free bonus:</span>
-                        <strong style={{ color: '#28a745' }}>🎉 {packetBreakdown.free} packets FREE!</strong>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
 
               <div className={styles.totalRow}>
                 <span>Total <small style={{ fontWeight: 400, opacity: 0.7 }}>(GST included)</small></span>
@@ -820,3 +650,5 @@ export default function CheckoutPage() {
     </div>
   );
 }
+
+

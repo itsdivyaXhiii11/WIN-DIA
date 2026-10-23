@@ -27,135 +27,24 @@ export default function CartPage() {
 
   useEffect(() => {
     // Cart is hydrated by the Persistence component in providers.jsx (user-scoped).
-    // Migration: Fix old combo product prices (₹1664 → ₹384)
-    let needsMigration = false;
-    let needsDeduplication = false;
-    
-    // Check for old prices
-    needsMigration = cartItems.some(item => {
-      const isCombo = item.id === '9d17cedd-4abd-4765-af1e-f368d17bad32' || 
-                      item.category === 'combo';
-      return isCombo && item.price === 1664;
-    });
-    
-    // Check for duplicates - more aggressive check for combo products
-    const seenIds = new Map(); // Map to track by base product ID
-    const duplicateIndices = new Set();
-    
-    cartItems.forEach((item, index) => {
-      const baseId = item._id || item.id;
-      const isCombo = baseId === '9d17cedd-4abd-4765-af1e-f368d17bad32' || 
-                      item.category === 'combo';
-      
-      if (isCombo) {
-        // For combo products, check if we've seen this base ID
-        if (seenIds.has(baseId)) {
-          // Check if they have the same flavor selections
-          const existing = seenIds.get(baseId);
-          const existingSelections = JSON.stringify(existing.item.flavorSelections || {});
-          const currentSelections = JSON.stringify(item.flavorSelections || {});
-          
-          if (existingSelections === currentSelections || !item.flavorSelections) {
-            // Same selections or no selections on current item = duplicate
-            duplicateIndices.add(index);
-            needsDeduplication = true;
-          } else {
-            // Different selections - both valid, update map with newer one
-            seenIds.set(`${baseId}_${currentSelections}`, { item, index });
-          }
-        } else {
-          seenIds.set(baseId, { item, index });
-        }
-      } else {
-        // Regular products - simple duplicate check by ID
-        const itemId = item.cartId || baseId;
-        if (seenIds.has(itemId)) {
-          duplicateIndices.add(index);
-          needsDeduplication = true;
-        } else {
-          seenIds.set(itemId, { item, index });
-        }
-      }
-    });
-    
-    if (needsMigration || needsDeduplication) {
-      let migratedCart = cartItems
-        .filter((_, index) => !duplicateIndices.has(index)) // Remove duplicates
-        .map(item => {
-          // Fix old pricing
-          const isCombo = item.id === '9d17cedd-4abd-4765-af1e-f368d17bad32' || 
-                          item.category === 'combo';
-          
-          if (isCombo && item.price === 1664) {
-            return {
-              ...item,
-              price: 384,
-              netWeight: 240,
-            };
-          }
-          return item;
-        });
-      
-      dispatch(setCart(migratedCart));
-      
-      if (needsDeduplication && migratedCart.length < cartItems.length) {
-        // Only show message if we actually removed items
-        toast.success("Removed duplicate items from cart!");
-      } else if (needsMigration) {
-        toast.success("Cart updated with new pricing!");
-      }
-    }
-    
+    // No need to re-hydrate from localStorage here.
     setMounted(true);
   }, []);
 
-  // Helper function to calculate bundle price
-  const getBundlePrice = (bundles) => {
-    if (bundles === 1) return 384;
-    if (bundles === 2) return 640;
-    if (bundles === 3) return 896;
-    if (bundles === 4) return 1152;
-    if (bundles === 5) return 1408;
-    if (bundles >= 6) return 1664 + ((bundles - 6) * 256);
-    return 0;
-  };
-
-  // Helper function to calculate paid vs free packets
-  const getPacketBreakdown = (bundles) => {
-    if (bundles === 1) return { total: 6, paid: 6, free: 0 };
-    if (bundles === 2) return { total: 12, paid: 10, free: 2 };
-    if (bundles === 3) return { total: 18, paid: 14, free: 4 };
-    if (bundles === 4) return { total: 24, paid: 18, free: 6 };
-    if (bundles === 5) return { total: 30, paid: 22, free: 8 };
-    if (bundles >= 6) {
-      const extraBundles = bundles - 6;
-      return { 
-        total: 36 + (extraBundles * 6), 
-        paid: 26 + (extraBundles * 4), 
-        free: 10 + (extraBundles * 2) 
-      };
-    }
-    return { total: 0, paid: 0, free: 0 };
-  };
-
-  // Calculate totals ONLY after mounted
-  const totalBundles = mounted ? cartItems.reduce((sum, item) => sum + (item.qty || 0), 0) : 0;
-  const subtotal = mounted ? getBundlePrice(totalBundles) : 0;
+  const totalBundles = cartItems.reduce((sum, i) => sum + i.qty, 0);
+  
+  // Apply tiered pricing formula: total = 384 + (N - 1) × 256
+  // This matches the server-side calculation in bundle-pricing.constants.ts
+  const tieredSubtotal = totalBundles > 0 ? 384 + (totalBundles - 1) * 256 : 0;
+  
+  const subtotal = tieredSubtotal;
   const discount = promoApplied ? subtotal * 0.1 : 0;
   const shipping = 0; // FREE DELIVERY — always ₹0
+  // GST is deactivated: no separate tax line is added. Price shown already
+  // includes GST rather than adding it on top — see bundle-pricing.constants.ts.
   const total = subtotal - discount + shipping;
   const progress = 100; // Always free shipping
   const remaining = 0;
-
-  // Calculate packet breakdown (paid vs free)
-  const packetBreakdown = mounted ? getPacketBreakdown(totalBundles) : { total: 0, paid: 0, free: 0 };
-
-  // Calculate total packets in cart (each bundle = 6 packets)
-  const totalPackets = totalBundles * 6;
-  
-  const isMultipleOfSix = totalPackets % 6 === 0 || totalPackets === 0;
-  const packetsToAdd = isMultipleOfSix ? 0 : 6 - (totalPackets % 6);
-  const packetsToRemove = isMultipleOfSix ? 0 : totalPackets % 6;
 
   const handleQty = useCallback((id, delta, curr, stock) => {
     const n = curr + delta;
@@ -221,23 +110,6 @@ export default function CartPage() {
 
   const handleCheckout = () => {
     if (!cartItems.length) return;
-    
-    // Validate cart has multiple of 6 packets
-    if (!isMultipleOfSix) {
-      if (packetsToAdd > 0) {
-        toast.error(
-          `Please add ${packetsToAdd} more packet${packetsToAdd > 1 ? 's' : ''} (${Math.ceil(packetsToAdd / 6)} bundle${Math.ceil(packetsToAdd / 6) > 1 ? 's' : ''}) to proceed. Orders must be in multiples of 6 packets.`,
-          { duration: 5000 }
-        );
-      } else {
-        toast.error(
-          `Please remove ${packetsToRemove} packet${packetsToRemove > 1 ? 's' : ''} to proceed. Orders must be in multiples of 6 packets.`,
-          { duration: 5000 }
-        );
-      }
-      return;
-    }
-    
     router.push("/checkout");
   };
 
@@ -294,10 +166,7 @@ export default function CartPage() {
           <div className={styles.itemsCol}>
             <AnimatePresence>
               {cartItems.map((item) => {
-                // Use cartId for combo products with flavor selections, otherwise use standard id
-                const id = item.cartId || item._id || item.id;
-                // For links, always use the actual product ID
-                const productId = item._id || item.id;
+                const id = item._id || item.id;
                 return (
                   <motion.div
                     key={id}
@@ -307,38 +176,14 @@ export default function CartPage() {
                     exit={{ opacity: 0, x: -40, height: 0, marginBottom: 0 }}
                     layout
                   >
-                    <Link href={`/product/${productId}`} className={styles.itemImg}>
+                    <Link href={`/product/${id}`} className={styles.itemImg}>
                       <img src={item.image || "/images/product-methi.jpg"} alt={item.name} />
                     </Link>
 
                     <div className={styles.itemInfo}>
-                      <Link href={`/product/${productId}`} className={styles.itemName}>{item.name}</Link>
+                      <Link href={`/product/${id}`} className={styles.itemName}>{item.name}</Link>
                       {item.flavor && <p className={styles.itemFlavor}>{item.flavor}</p>}
                       {item.netWeight && <p className={styles.itemWeight}>{item.netWeight}g</p>}
-
-                      {/* Combo Flavor Breakdown */}
-                      {item.flavorSelections && (
-                        <div className={styles.flavorBreakdown}>
-                          <p className={styles.flavorBreakdownTitle}>📦 Your Combo Selection:</p>
-                          <ul className={styles.flavorList}>
-                            {Object.entries(item.flavorSelections)
-                              .filter(([_, count]) => count > 0)
-                              .map(([flavorId, count]) => {
-                                const flavorNames = {
-                                  'curry-leaves': 'Curry Leaves',
-                                  'garlic': 'Garlic',
-                                  'jeera': 'Jeera',
-                                  'onion': 'Onion'
-                                };
-                                return (
-                                  <li key={flavorId}>
-                                    <strong>{flavorNames[flavorId] || flavorId}:</strong> {count} packet{count > 1 ? 's' : ''} ({count * 40}g)
-                                  </li>
-                                );
-                              })}
-                          </ul>
-                        </div>
-                      )}
 
                       <div className={styles.itemBadges}>
                         {item.isLowGI && <span className={styles.badge}>Low GI</span>}
@@ -418,52 +263,6 @@ export default function CartPage() {
                 <div className={styles.bRow}><span>Shipping</span><span className={shipping === 0 ? styles.free : ""}>{shipping === 0 ? "FREE" : `₹${shipping}`}</span></div>
               </div>
 
-              {/* Packet Breakdown - Show paid vs free packets */}
-              {totalBundles > 0 && (
-                <div style={{
-                  background: 'linear-gradient(135deg, rgba(201,168,76,0.08) 0%, rgba(201,168,76,0.03) 100%)',
-                  border: '1px solid rgba(201,168,76,0.2)',
-                  borderRadius: '8px',
-                  padding: '12px 16px',
-                  marginBottom: '16px',
-                  fontSize: '0.9rem'
-                }}>
-                  <div style={{ 
-                    display: 'flex', 
-                    alignItems: 'center', 
-                    gap: '8px',
-                    marginBottom: '8px',
-                    fontWeight: 600,
-                    color: '#3B1F0F'
-                  }}>
-                    <FiPackage style={{ color: '#C9A84C' }} />
-                    <span>Your Order Breakdown</span>
-                  </div>
-                  <div style={{ 
-                    display: 'flex', 
-                    flexDirection: 'column', 
-                    gap: '4px',
-                    fontSize: '0.85rem',
-                    color: '#6B5948'
-                  }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span>Total packets:</span>
-                      <strong style={{ color: '#3B1F0F' }}>{packetBreakdown.total} packets ({totalBundles} bundle{totalBundles > 1 ? 's' : ''})</strong>
-                    </div>
-                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                      <span>You pay for:</span>
-                      <strong style={{ color: '#3B1F0F' }}>{packetBreakdown.paid} packets</strong>
-                    </div>
-                    {packetBreakdown.free > 0 && (
-                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                        <span>Free bonus:</span>
-                        <strong style={{ color: '#28a745' }}>🎉 {packetBreakdown.free} packets FREE!</strong>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
               <div className={styles.totalRow}>
                 <span>Total <small style={{ fontWeight: 400, opacity: 0.7 }}>(GST included)</small></span>
                 <span>₹{total.toFixed(2)}</span>
@@ -472,30 +271,6 @@ export default function CartPage() {
               <button className={styles.checkoutBtn} onClick={handleCheckout}>
                 Proceed to Checkout <FiArrowRight />
               </button>
-
-              {/* Cart validation message */}
-              {!isMultipleOfSix && (
-                <div className={styles.validationMessage}>
-                  <FiPackage />
-                  <div>
-                    <strong>Cart contains {totalPackets} packet{totalPackets !== 1 ? 's' : ''}</strong>
-                    <p>
-                      {packetsToAdd > 0 
-                        ? `Add ${packetsToAdd} more packet${packetsToAdd > 1 ? 's' : ''} to proceed`
-                        : `Remove ${packetsToRemove} packet${packetsToRemove > 1 ? 's' : ''} to proceed`
-                      }
-                    </p>
-                    <small>Orders must be in multiples of 6 packets (1 bundle = 6 packets)</small>
-                  </div>
-                </div>
-              )}
-
-              {isMultipleOfSix && cartItems.length > 0 && (
-                <div className={styles.readyMessage}>
-                  <FiPackage />
-                  <span>✓ Cart ready! {totalPackets} packets ({totalPackets / 6} bundle{totalPackets / 6 > 1 ? 's' : ''})</span>
-                </div>
-              )}
 
               <div className={styles.trustRow}>
                 <span><FiShield /> Secure Payment</span>

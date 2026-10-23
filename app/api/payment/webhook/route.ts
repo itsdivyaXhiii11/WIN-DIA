@@ -12,10 +12,19 @@ export async function POST(request: Request) {
     // Exact raw body: the signature is computed over these bytes. Never parse + re-stringify before verifying.
     const rawBody = await request.text();
     const signature = request.headers.get('x-razorpay-signature') || '';
-    const eventId = request.headers.get('x-razorpay-event-id');
+
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      return NextResponse.json(
+        createErrorResponse('VALIDATION_ERROR', 'Invalid JSON payload'),
+        { status: 400 }
+      );
+    }
 
     const paymentService = container.resolve<PaymentService>(ServiceTokens.PaymentService);
-    const result = await paymentService.handleWebhook(rawBody, signature, eventId);
+    const result = await paymentService.handleWebhook(payload, signature);
 
     return handleServiceResult(result);
   } catch (err: any) {

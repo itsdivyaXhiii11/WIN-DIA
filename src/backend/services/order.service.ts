@@ -9,7 +9,7 @@ import { OrderStatusHistoryRepository } from '../repositories/order-status-histo
 import { ShipmentRepository } from '../repositories/shipment.repository';
 import { InventoryService } from './inventory.service';
 import { logger } from '../utils/logger.util';
-import { container, RepositoryTokens } from '../providers/container.provider';
+import { container, RepositoryTokens, ServiceTokens } from '../providers/container.provider';
 
 /**
  * Valid order status transitions map.
@@ -50,6 +50,7 @@ export interface OrderService {
   updateOrderStatus(orderId: string, status: OrderStatus, note?: string, updatedBy?: string): Promise<Result<Order, AppError>>;
   writeStatusHistory(orderId: string, status: OrderStatus, note?: string, createdBy?: string): Promise<Result<OrderStatusHistory, AppError>>;
   cancelOrder(orderId: string, userId: string, reason?: string): Promise<Result<Order, AppError>>;
+  markOrderPaid(orderId: string, note?: string, updatedBy?: string): Promise<Result<Order, AppError>>;
 }
 
 export class OrderServiceImpl implements OrderService {
@@ -57,24 +58,23 @@ export class OrderServiceImpl implements OrderService {
   private orderItemRepo: OrderItemRepository;
   private statusHistoryRepo: OrderStatusHistoryRepository;
   private shipmentRepo: ShipmentRepository;
+  private inventoryService: InventoryService;
 
   constructor(
     orderRepo?: OrderRepository,
     orderItemRepo?: OrderItemRepository,
     statusHistoryRepo?: OrderStatusHistoryRepository,
-    _inventoryService?: InventoryService // unused now (stock lives in the DB) — kept so container wiring is unchanged
+    inventoryService?: InventoryService
   ) {
     this.orderRepo = orderRepo || container.resolve<OrderRepository>(RepositoryTokens.OrderRepository);
     this.orderItemRepo = orderItemRepo || container.resolve<OrderItemRepository>(RepositoryTokens.OrderItemRepository);
     this.statusHistoryRepo = statusHistoryRepo || container.resolve<OrderStatusHistoryRepository>(RepositoryTokens.OrderStatusHistoryRepository);
     this.shipmentRepo = container.resolve<ShipmentRepository>(RepositoryTokens.ShipmentRepository);
+    this.inventoryService = inventoryService || container.resolve<InventoryService>(ServiceTokens.InventoryService);
   }
 
-  /**
-   * NOTE: not used by checkout any more. Checkout goes through create_checkout_order_transaction,
-   * which generates the order number itself. Do not use this for customer orders.
-   */
   public async createOrder(userId: string, orderData: Partial<Order>): Promise<Result<Order, AppError>> {
+    const start = Date.now();
     logger.info(`[OrderService.createOrder] Creating order for user ${userId}`);
     const orderNumber = orderData.order_number || generateOrderNumber();
 
@@ -93,24 +93,45 @@ export class OrderServiceImpl implements OrderService {
       order_notes: orderData.order_notes || null,
     };
 
+    console.log(`[OrderService.createOrder] Repository: OrderRepository | Method: create | Payload:`, payload);
     const newOrderRes = await this.orderRepo.create(payload);
+    const elapsed = Date.now() - start;
+
     if (!newOrderRes.success) {
-      logger.error(`[OrderService.createOrder] Failed: ${newOrderRes.error.message}`);
+      console.error(`[OrderService.createOrder] FAILURE | Time: ${elapsed}ms | Repository Error:`, {
+        name: newOrderRes.error.name,
+        message: newOrderRes.error.message,
+        stack: newOrderRes.error.stack,
+        details: newOrderRes.error.details,
+      });
       return newOrderRes;
     }
 
+    console.log(`[OrderService.createOrder] SUCCESS | Time: ${elapsed}ms | Created Order ID: ${newOrderRes.value.id}`);
     await this.writeStatusHistory(newOrderRes.value.id, OrderStatus.PLACED, 'Order placed successfully', userId);
     return success(newOrderRes.value);
   }
 
   public async createOrderItems(orderId: string, items: Partial<OrderItem>[]): Promise<Result<OrderItem[], AppError>> {
+    const start = Date.now();
     logger.info(`[OrderService.createOrderItems] Adding ${items.length} items to order ${orderId}`);
     const prepared = items.map((i) => ({ ...i, order_id: orderId }));
 
+    console.log(`[OrderService.createOrderItems] Repository: OrderItemRepository | Method: createMany | Items:`, prepared);
     const res = await this.orderItemRepo.createMany(prepared);
+    const elapsed = Date.now() - start;
+
     if (!res.success) {
-      logger.error(`[OrderService.createOrderItems] Failed: ${res.error.message}`);
+      console.error(`[OrderService.createOrderItems] FAILURE | Time: ${elapsed}ms | Repository Error:`, {
+        name: res.error.name,
+        message: res.error.message,
+        stack: res.error.stack,
+        details: res.error.details,
+      });
+      return res;
     }
+
+    console.log(`[OrderService.createOrderItems] SUCCESS | Time: ${elapsed}ms | Items Count: ${res.value.length}`);
     return res;
   }
 
@@ -166,13 +187,33 @@ export class OrderServiceImpl implements OrderService {
     const updateRes = await this.orderRepo.update(orderId, { order_status: status });
     if (!updateRes.success) return updateRes;
 
-    // Stock is deducted per flavour, in packets, by the DB (confirm_windia_razorpay_payment_and_deduct_stock).
-    // The old atomic_restore_stock is obsolete and no app-side restore may touch inventory, so a paid
-    // order that gets cancelled needs manual reconciliation until the DB owner provides a restore function.
-    if (status === OrderStatus.CANCELLED && existing.value.payment_status === PaymentStatus.PAID) {
-      logger.warn(
-        `[OrderService.updateOrderStatus] Paid order ${orderId} cancelled — stock was deducted and is NOT restored automatically; manual reconciliation required`
-      );
+    // STOCK RESTORATION: When an order is cancelled and payment was already processed
+    // (i.e., stock was deducted), restore inventory for each order item.
+    if (status === OrderStatus.CANCELLED) {
+      const paymentStatus = existing.value.payment_status;
+      // Stock is deducted only after successful payment, so restore only if paid
+      const stockWasDeducted = paymentStatus === PaymentStatus.PAID;
+      // Also restore if order was in processing/shipped (meaning payment went through)
+      const orderWasProcessed = ['processing', 'confirmed'].includes(currentStatus);
+
+      if (stockWasDeducted || orderWasProcessed) {
+        logger.info(`[OrderService.updateOrderStatus] Order ${orderId} cancelled — restoring stock for all items`);
+        const itemsRes = await this.orderItemRepo.findByOrderId(orderId);
+        if (itemsRes.success && itemsRes.value.length > 0) {
+          for (const item of itemsRes.value) {
+            if (item.product_id && item.qty > 0) {
+              const restoreRes = await this.inventoryService.restoreStockAfterCancellation(item.product_id, item.qty);
+              if (!restoreRes.success) {
+                logger.error(
+                  `[OrderService.updateOrderStatus] Stock restoration failed for product ${item.product_id}: ${restoreRes.error.message}`
+                );
+              }
+            }
+          }
+        } else if (!itemsRes.success) {
+          logger.error(`[OrderService.updateOrderStatus] Could not load order items for stock restoration: ${itemsRes.error.message}`);
+        }
+      }
     }
 
     await this.writeStatusHistory(orderId, status, note || `Status updated to ${status}`, updatedBy);
@@ -187,13 +228,35 @@ export class OrderServiceImpl implements OrderService {
   }
 
   /**
+   * Marks an order's payment_status as PAID and advances order_status to
+   * PROCESSING, in one place. The client-side Razorpay verify flow
+   * (app/api/payment/verify/route.ts) previously only called
+   * updateOrderStatus(), which updates order_status but never touches
+   * payment_status — so orders stayed stuck on "pending" in the admin
+   * dashboard forever unless the Razorpay webhook happened to fire and
+   * update it separately. This keeps both fields in sync for every
+   * successful-payment code path.
+   */
+  public async markOrderPaid(orderId: string, note?: string, updatedBy?: string): Promise<Result<Order, AppError>> {
+    const statusRes = await this.updateOrderStatus(orderId, OrderStatus.CONFIRMED, note, updatedBy);
+    if (!statusRes.success) return statusRes;
+
+    const paymentUpdateRes = await this.orderRepo.update(orderId, { payment_status: PaymentStatus.PAID });
+    if (!paymentUpdateRes.success) return paymentUpdateRes;
+
+    return success(paymentUpdateRes.value);
+  }
+
+  /**
    * Customer-initiated cancellation. Only the order's owner may call this
    * (ownership is enforced via getOrderById's userId check). Reuses the same
-   * transition logic as the admin path via updateOrderStatus, and marks
-   * payment_status as FAILED when the customer backed out before completing
-   * payment so an abandoned order doesn't sit forever looking like a live,
-   * pending payment.
-   *
+   * transition/stock-restoration logic as the admin path via updateOrderStatus,
+   * and additionally marks payment_status as FAILED when the customer backed
+   * out before ever completing payment (e.g. closed the Razorpay checkout),
+   * so an abandoned order doesn't sit forever looking like a live, pending
+   * payment — this is what previously showed as "Placed / Pending" with no
+   * way to distinguish it from a genuinely in-progress order.
+   * 
    * CANCELLATION POLICY: Customers can cancel their order ONLY until 2 days
    * before shipping is assigned. If shipped_at is set, the cutoff is 2 days
    * before that date at 12:00 PM (noon).
@@ -202,21 +265,16 @@ export class OrderServiceImpl implements OrderService {
     const existing = await this.getOrderById(orderId, userId);
     if (!existing.success) return existing;
 
+    const order = existing.value;
+
+    // Check if shipment has been assigned - only allow cancel before shipment
     const shipmentRes = await this.shipmentRepo.findByOrderId(orderId);
     if (shipmentRes.success && shipmentRes.value && shipmentRes.value.shipped_at) {
-      const shippedAt = new Date(shipmentRes.value.shipped_at);
-      const cutoffDate = new Date(shippedAt);
-      cutoffDate.setDate(cutoffDate.getDate() - 2); // 2 days before shipping
-      cutoffDate.setHours(12, 0, 0, 0); // 12:00 PM
-
-      const now = new Date();
-      if (now > cutoffDate) {
-        return failure(
-          new ValidationError(
-            `Cancellation deadline has passed. Orders must be cancelled at least 2 days before shipping date (by ${cutoffDate.toLocaleDateString('en-IN')} 12:00 PM).`
-          )
-        );
-      }
+      return failure(
+        new ValidationError(
+          `Cannot cancel - order has already been shipped. Please contact support for assistance.`
+        )
+      );
     }
 
     const updateRes = await this.updateOrderStatus(
@@ -227,15 +285,30 @@ export class OrderServiceImpl implements OrderService {
     );
     if (!updateRes.success) return updateRes;
 
-    // If payment never completed, reflect that instead of leaving it on "pending".
-    // If it was already paid, leave PAID — refunding is a separate admin-initiated step.
-    if (updateRes.value.payment_status === PaymentStatus.PENDING) {
-      const paymentUpdateRes = await this.orderRepo.update(orderId, { payment_status: PaymentStatus.FAILED });
-      if (paymentUpdateRes.success) {
-        return success(paymentUpdateRes.value);
-      }
-      logger.error(`[OrderService.cancelOrder] Could not update payment_status for order ${orderId}: ${paymentUpdateRes.error.message}`);
+    // Handle payment status based on current state
+    let newPaymentStatus = order.payment_status;
+    
+    if (order.payment_status === PaymentStatus.PENDING) {
+      // Payment never completed - mark as failed
+      newPaymentStatus = PaymentStatus.FAILED;
+    } else if (order.payment_status === PaymentStatus.PAID) {
+      // Online payment was completed - initiate refund
+      newPaymentStatus = PaymentStatus.REFUND_INITIATED;
+      logger.info(`[OrderService.cancelOrder] Initiating refund for paid order ${orderId}`);
+      // TODO: Integrate with Razorpay refund API here
+    } else if (order.payment_status === PaymentStatus.COD_PENDING) {
+      // COD order cancelled before delivery - no payment collected, just mark as failed
+      newPaymentStatus = PaymentStatus.FAILED;
     }
+
+    // Update payment status
+    const paymentUpdateRes = await this.orderRepo.update(orderId, { payment_status: newPaymentStatus });
+    if (paymentUpdateRes.success) {
+      return success(paymentUpdateRes.value);
+    }
+    
+    // Non-fatal: the order is cancelled either way, just log and return what we have.
+    logger.error(`[OrderService.cancelOrder] Could not update payment_status for order ${orderId}: ${paymentUpdateRes.error.message}`);
 
     return success(updateRes.value);
   }
