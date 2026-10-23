@@ -71,6 +71,17 @@ export async function POST(request) {
         return NextResponse.json({ success: true, user_id: record.user_id, auto_login: false });
       }
 
+      /* === Link any eligible guest orders (silent, non-blocking) === */
+      try {
+        await supabaseAdmin.rpc('link_guest_orders_to_account', {
+          p_user_id: record.user_id,
+          p_user_email: email,
+        });
+      } catch (linkErr) {
+        // Don't fail registration if linking fails
+        console.error('Guest order linking failed (non-critical):', linkErr);
+      }
+
       return NextResponse.json({ success: true, user_id: record.user_id, auto_login: true });
     }
 

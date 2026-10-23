@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
-const PROTECTED_PREFIXES = ['/profile', '/wishlist', '/cart'];
+const PROTECTED_PREFIXES = ['/profile'];
 const GUEST_ONLY_PATHS = ['/login', '/register'];
 
 function isProtectedPath(path) {
@@ -52,10 +52,6 @@ export const config = {
   matcher: [
     '/profile',
     '/profile/:path*',
-    '/wishlist',
-    '/wishlist/:path*',
-    '/cart',
-    '/cart/:path*',
     '/login',
     '/register',
   ],

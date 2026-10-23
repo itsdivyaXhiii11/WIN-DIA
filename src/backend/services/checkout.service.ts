@@ -34,7 +34,7 @@ export interface CheckoutResult {
 }
 
 export interface CheckoutService {
-  processCheckout(userId: string, dto: CreateOrderDTO): Promise<Result<CheckoutResult, AppError>>;
+  processCheckout(userId: string | null, dto: CreateOrderDTO): Promise<Result<CheckoutResult, AppError>>;
 }
 
 interface PreparedOrderItems {
@@ -92,7 +92,7 @@ export class CheckoutServiceImpl implements CheckoutService {
    * STEP 2: ADDRESS_LOOKUP — resolves the shipping address either from the
    * inline payload or by looking up the user's saved addresses.
    */
-  private async resolveShippingAddress(userId: string, dto: CreateOrderDTO): Promise<Result<any, AppError>> {
+  private async resolveShippingAddress(userId: string | null, dto: CreateOrderDTO): Promise<Result<any, AppError>> {
     const step2Start = Date.now();
     console.log(`[TRACE STEP 2: ADDRESS_LOOKUP] Checking address payload or user addresses`);
     let selectedAddress: any = null;
@@ -108,9 +108,10 @@ export class CheckoutServiceImpl implements CheckoutService {
         state: rawAddr.state || '',
         pincode: String(rawAddr.pincode || rawAddr.postal_code || ''),
         country: rawAddr.country || 'India',
+        email: rawAddr.email || (dto as any).customer_email || (dto as any).email || null,
       };
       console.log(`[TRACE STEP 2: ADDRESS_LOOKUP] Used inline address payload:`, selectedAddress);
-    } else {
+    } else if (userId) {
       console.log(`[TRACE STEP 2: ADDRESS_LOOKUP] Calling UserService.getUserAddresses for userId: ${userId}`);
       const addrRes = await this.userService.getUserAddresses(userId);
       if (addrRes.success && addrRes.value.length > 0) {
@@ -132,15 +133,18 @@ export class CheckoutServiceImpl implements CheckoutService {
    * STEP 3: CART_LOOKUP — resolves the items to check out, either from the
    * request payload or by falling back to the user's cart.
    */
-  private async resolveCartItems(userId: string, dto: CreateOrderDTO): Promise<Result<any[], AppError>> {
+  private async resolveCartItems(userId: string | null, dto: CreateOrderDTO): Promise<Result<any[], AppError>> {
     const step3Start = Date.now();
     console.log(`[TRACE STEP 3: CART_LOOKUP] Resolving items from request dto or CartService`);
     let rawItems: any[] = (dto as any).items || [];
     if (!rawItems || rawItems.length === 0) {
-      console.log(`[TRACE STEP 3: CART_LOOKUP] Calling CartService.getCart for userId: ${userId}`);
-      const cartRes = await this.cartService.getCart(userId);
-      if (cartRes.success && cartRes.value.items) {
-        rawItems = cartRes.value.items;
+      // Only load cart for authenticated users
+      if (userId) {
+        console.log(`[TRACE STEP 3: CART_LOOKUP] Calling CartService.getCart for userId: ${userId}`);
+        const cartRes = await this.cartService.getCart(userId);
+        if (cartRes.success && cartRes.value.items) {
+          rawItems = cartRes.value.items;
+        }
       }
     }
     const step3Time = Date.now() - step3Start;
@@ -351,7 +355,7 @@ export class CheckoutServiceImpl implements CheckoutService {
    * repository/service calls if that transaction fails.
    */
   private async createOrder(
-    userId: string,
+    userId: string | null,
     dto: CreateOrderDTO,
     selectedAddress: any,
     preparedOrderItems: Record<string, unknown>[],
@@ -360,6 +364,7 @@ export class CheckoutServiceImpl implements CheckoutService {
     pendingPaymentPlaceholderId: string
   ): Promise<Result<OrderCreationOutcome, AppError>> {
     const { subtotal, discount, tax, shipping, total } = pricing;
+
 
     const step7Start = Date.now();
     console.log(`[TRACE STEP 7: RPC_INVOCATION] Calling OrderRepository.createCheckoutTransaction RPC`);
@@ -370,6 +375,9 @@ export class CheckoutServiceImpl implements CheckoutService {
       paymentData: { pendingPaymentPlaceholderId, total },
     });
 
+    // Extract customer_email and customer_phone for guest orders
+    const customerEmail = (dto as any).customer_email || (dto as any).email || selectedAddress.email || null;
+    const customerPhone = selectedAddress.phone || null;
     const txRes = await this.orderRepo.createCheckoutTransaction(
       userId,
       {
@@ -382,6 +390,8 @@ export class CheckoutServiceImpl implements CheckoutService {
         payment_method: selectedPaymentMethod,
         shipping_address: selectedAddress,
         order_notes: dto.order_notes || (dto as any).orderNotes || null,
+        customer_email: customerEmail,
+        customer_phone: customerPhone,
       },
       preparedOrderItems,
       {
@@ -514,7 +524,7 @@ export class CheckoutServiceImpl implements CheckoutService {
     }
   }
 
-  public async processCheckout(userId: string, dto: CreateOrderDTO): Promise<Result<CheckoutResult, AppError>> {
+  public async processCheckout(userId: string | null, dto: CreateOrderDTO): Promise<Result<CheckoutResult, AppError>> {
     console.log(`\n--- [CHECKOUT_SERVICE: ENTER] processCheckout for userId: ${userId} ---`);
     const startTime = Date.now();
 
@@ -522,9 +532,14 @@ export class CheckoutServiceImpl implements CheckoutService {
       // STEP 1: VALIDATION
       const step1Start = Date.now();
       console.log(`[TRACE STEP 1: VALIDATION] Validating DTO payload:`, dto);
-      if (!userId) {
-        console.log(`[TRACE STEP 1: VALIDATION] FAILURE | Error: User ID is required`);
-        return failure(new ValidationError('User ID is required for checkout'));
+      // Guest checkout is allowed if customer_email is provided
+      const isGuest = !userId;
+      if (isGuest) {
+        const email = (dto as any).customer_email || (dto as any).email;
+        if (!email || typeof email !== 'string' || !email.trim()) {
+          console.log(`[TRACE STEP 1: VALIDATION] FAILURE | Error: Email is required for guest checkout`);
+          return failure(new ValidationError('Email is required for guest checkout'));
+        }
       }
       const step1Time = Date.now() - step1Start;
       console.log(`[TRACE STEP 1: VALIDATION] SUCCESS | Time: ${step1Time}ms`);
@@ -577,7 +592,10 @@ export class CheckoutServiceImpl implements CheckoutService {
       const { createdOrder, createdPayment, createdShipment } = orderCreationRes.value;
 
       // STEP 9: CLEAR_CART & INCREMENT COUPON USAGE
-      await this.finalizeCartAndCoupon(userId, validatedCouponId);
+      // Only finalize cart/coupon for authenticated users
+      if (userId) {
+        await this.finalizeCartAndCoupon(userId, validatedCouponId);
+      }
 
       // COD orders have no payment to wait for, so book the DTDC
       // shipment right away. Online (Razorpay) orders instead get booked

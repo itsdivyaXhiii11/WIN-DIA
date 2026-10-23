@@ -56,7 +56,7 @@ export function ProductRange({ heading, headingId, products, theme }: ProductRan
     { id: "curry-leaf", name: "Curry Leaves", available: true, stock: 100 },
   ], []);
 
-  const requireAuth = async () => {
+  const requireAuthForWishlist = async () => {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) {
       router.push("/login?next=/shop");
@@ -71,17 +71,16 @@ export function ProductRange({ heading, headingId, products, theme }: ProductRan
     
     if (isCombo && next > 0) {
       // Open combo selector modal instead of directly adding to cart
-      if (!(await requireAuth())) return;
+      // No auth required - will check at checkout
       setSelectedComboProduct(product);
       setComboModalOpen(true);
       return;
     }
 
-    // Regular product logic
+    // Regular product logic - no auth required
     const nextQuantity = Math.max(0, next);
     const current = quantities[product.id] ?? 0;
     if (nextQuantity > current) {
-      if (!(await requireAuth())) return;
       dispatch(addToCart(toStoreProduct(product, theme), nextQuantity - current));
       toast.success("Added to cart");
     }
@@ -98,7 +97,7 @@ export function ProductRange({ heading, headingId, products, theme }: ProductRan
       return;
     }
 
-    // Create combo product with selections
+    // Create combo product with selections - no auth required
     const comboData = {
       ...toStoreProduct(selectedComboProduct, theme),
       flavorSelections: selections, // Cart looks for this key
@@ -122,7 +121,7 @@ export function ProductRange({ heading, headingId, products, theme }: ProductRan
     const storeProduct = toStoreProduct(product, theme);
     const isCurrentlyWishlisted = wishlistedIds.has(storeProduct.id);
     
-    if (!isCurrentlyWishlisted && !(await requireAuth())) return;
+    if (!isCurrentlyWishlisted && !(await requireAuthForWishlist())) return;
     
     if (!isCurrentlyWishlisted) {
       dispatch(addToWishlist(storeProduct));

@@ -65,12 +65,12 @@ export default function StoreNav() {
 
           {/* WISHLIST */}
           <Link href="/wishlist">
-            <FiHeart /> {user ? wishCount : 0}
+            <FiHeart /> {wishCount}
           </Link>
 
           {/* CART */}
           <Link href="/cart">
-            <FiShoppingCart /> {user ? cartCount : 0}
+            <FiShoppingCart /> {cartCount}
           </Link>
 
           {/* ADMIN DASHBOARD LINK (visible only to admin accounts) */}

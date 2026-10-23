@@ -10,12 +10,13 @@ export interface OrderRepository extends IBaseRepository<Order, string, Partial<
   findByUserId(userId: string): Promise<Result<Order[], AppError>>;
   findWithDetails(orderId: string): Promise<Result<Record<string, unknown> | null, AppError>>;
   createCheckoutTransaction(
-    userId: string,
+    userId: string | null,
     orderData: Record<string, unknown>,
     orderItems: Record<string, unknown>[],
     paymentData: Record<string, unknown>,
     shipmentData: Record<string, unknown>
   ): Promise<Result<Record<string, unknown>, AppError>>;
+  linkGuestOrders(userId: string, userEmail: string): Promise<Result<{ linked_orders: number; addresses_saved: number }, AppError>>;
 }
 
 export class SupabaseOrderRepository
@@ -182,7 +183,7 @@ export class SupabaseOrderRepository
   }
 
   public async createCheckoutTransaction(
-    userId: string,
+    userId: string | null,
     orderData: Record<string, unknown>,
     orderItems: Record<string, unknown>[],
     paymentData: Record<string, unknown>,
@@ -224,6 +225,42 @@ export class SupabaseOrderRepository
       return success({ order, items: items || [], payment, shipment });
     } catch (err) {
       return failure(this.handleError(err, 'createCheckoutTransaction'));
+    }
+  }
+
+  /**
+   * Link guest orders to authenticated user account.
+   * Only links orders with payment_status = 'paid' and matching customer_email.
+   * Also saves shipping addresses to public.addresses if they don't exist.
+   */
+  public async linkGuestOrders(
+    userId: string,
+    userEmail: string
+  ): Promise<Result<{ linked_orders: number; addresses_saved: number }, AppError>> {
+    try {
+      const client = getAdminClient();
+
+      const { data, error } = await client.rpc('link_guest_orders_to_account', {
+        p_user_id: userId,
+        p_user_email: userEmail,
+      });
+
+      if (error) {
+        return failure(this.handleError(error, 'linkGuestOrders'));
+      }
+
+      const result = data as { success: boolean; linked_orders?: number; addresses_saved?: number; error?: string };
+
+      if (!result.success) {
+        return failure(this.handleError(new Error(result.error || 'Failed to link guest orders'), 'linkGuestOrders'));
+      }
+
+      return success({
+        linked_orders: result.linked_orders || 0,
+        addresses_saved: result.addresses_saved || 0,
+      });
+    } catch (err) {
+      return failure(this.handleError(err, 'linkGuestOrders'));
     }
   }
 }

@@ -59,6 +59,17 @@ export async function POST(request) {
       .update({ failed_login_count: 0, locked_until: null })
       .eq('id', profile.id);
 
+    /* === Link any eligible guest orders (silent, non-blocking) === */
+    try {
+      await supabaseAdmin.rpc('link_guest_orders_to_account', {
+        p_user_id: data.user.id,
+        p_user_email: email,
+      });
+    } catch (linkErr) {
+      // Don't fail login if linking fails
+      console.error('Guest order linking failed (non-critical):', linkErr);
+    }
+
     return NextResponse.json({
       session: data.session,
     });

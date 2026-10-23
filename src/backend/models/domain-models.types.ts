@@ -142,6 +142,8 @@ export interface CartItem extends BaseEntity {
 export interface Order extends BaseEntity {
   order_number: string;
   user_id: Nullable<string>;
+  customer_email: Nullable<string>;
+  customer_phone: Nullable<string>;
   order_status: OrderStatus;
   payment_status: PaymentStatus;
   payment_method: Nullable<string>;

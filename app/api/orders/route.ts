@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { ServiceTokens } from '@/src/backend/providers/container.provider';
+import { container, ServiceTokens } from '@/src/backend/providers/container.provider';
 import { CheckoutService } from '@/src/backend/services/checkout.service';
 import { OrderService } from '@/src/backend/services/order.service';
 import { getAuthUserContext, handleServiceResult } from '@/src/backend/utils/route-helper.util';
@@ -17,13 +17,32 @@ function handleGlobalError(err: any) {
 
 export async function POST(request: Request) {
   try {
-    const authRes = await getAuthUserContext(request);
-    if (!authRes.success) {
-      return handleServiceResult(authRes);
-    }
-
     const body = await request.json().catch(() => ({}));
     const isCod = body.paymentMethod === 'cod' || body.payment_method === 'cod';
+    
+    // Try to authenticate, but allow guest checkout
+    const authRes = await getAuthUserContext(request);
+    const isGuest = !authRes.success;
+    const userId = isGuest ? null : authRes.value.id;
+    
+    // For guest checkout, require and validate customer_email
+    if (isGuest) {
+      const email = body.customer_email || body.email;
+      if (!email || typeof email !== 'string' || !email.trim()) {
+        return NextResponse.json(
+          createErrorResponse('VALIDATION_ERROR', 'Email is required for guest checkout'),
+          { status: 400 }
+        );
+      }
+      
+      // Validate email format
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        return NextResponse.json(
+          createErrorResponse('VALIDATION_ERROR', 'Valid email address is required'),
+          { status: 400 }
+        );
+      }
+    }
 
     // Fail early (before an order is created) if Razorpay isn't configured.
     const env = getEnv();
@@ -35,9 +54,12 @@ export async function POST(request: Request) {
       );
     }
 
-    const checkoutService = authRes.value.scope.resolve<CheckoutService>(ServiceTokens.CheckoutService);
+    // For authenticated users, use request-scoped DI; for guests, use global container
+    const checkoutService = isGuest 
+      ? container.resolve<CheckoutService>(ServiceTokens.CheckoutService)
+      : authRes.value.scope.resolve<CheckoutService>(ServiceTokens.CheckoutService);
 
-    const result = await checkoutService.processCheckout(authRes.value.id, body);
+    const result = await checkoutService.processCheckout(userId, body);
     if (!result.success) {
       return handleServiceResult(result);
     }

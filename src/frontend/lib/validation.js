@@ -17,6 +17,11 @@ export function validatePincode(pincode) {
 export function validateAddress(address = {}) {
   const errors = {};
   if (!address.name || address.name.trim().length < 2) errors.name = "Full name is required";
+  if (!address.email || !address.email.trim()) {
+    errors.email = "Email is required";
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address.email.trim())) {
+    errors.email = "Enter a valid email";
+  }
   if (!address.street || address.street.trim().length < 5) errors.street = "Street address is required";
   if (!address.city || address.city.trim().length < 2) errors.city = "City is required";
   if (!address.state || address.state.trim().length < 2) errors.state = "State is required";

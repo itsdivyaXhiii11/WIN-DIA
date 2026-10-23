@@ -109,8 +109,7 @@ function ProductDetailContent({
   ];
 
   const handleComboConfirm = async (selections: Record<string, number>) => {
-    if (!(await requireAuth())) return;
-
+    // No auth required for adding combo to cart
     // Add combo with user's flavor selections
     const comboProduct = {
       ...storeProduct,
@@ -198,7 +197,7 @@ function ProductDetailContent({
      Authentication
   ----------------------------- */
 
-  const requireAuth = async () => {
+  const requireAuthForWishlist = async () => {
     const {
       data: { user },
     } = await supabase.auth.getUser();
@@ -219,8 +218,7 @@ function ProductDetailContent({
     const nextQuantity = Math.max(0, next);
 
     if (nextQuantity > quantity) {
-      if (!(await requireAuth())) return;
-
+      // No auth required for adding to cart
       dispatch(
         addToCart(
           toStoreProduct(product, theme),
@@ -241,7 +239,7 @@ function ProductDetailContent({
   const toggleWishlist = async () => {
     const next = !isWishlisted;
 
-    if (next && !(await requireAuth())) return;
+    if (next && !(await requireAuthForWishlist())) return;
 
     if (next) {
       dispatch(addToWishlist(storeProduct));
@@ -257,8 +255,7 @@ function ProductDetailContent({
   ----------------------------- */
 
   const buyNow = async () => {
-    if (!(await requireAuth())) return;
-
+    // No auth required - will check at checkout
     dispatch(
       addToCart(
         toStoreProduct(product, theme),
@@ -304,8 +301,7 @@ function ProductDetailContent({
     }
 
     if (nextQuantity > current) {
-      if (!(await requireAuth())) return;
-
+      // No auth required for adding to cart
       dispatch(
         addToCart(
           toStoreProduct(recProduct, recTheme),
@@ -334,7 +330,7 @@ function ProductDetailContent({
     const storeProduct = toStoreProduct(recProduct, recTheme);
     const next = !recWishlistedIds.has(storeProduct.id);
 
-    if (next && !(await requireAuth())) return;
+    if (next && !(await requireAuthForWishlist())) return;
 
     if (next) {
       dispatch(addToWishlist(storeProduct));

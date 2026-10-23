@@ -27,13 +27,24 @@ function loadRazorpay() {
   });
 }
 
+// Safe JSON reader: returns null instead of throwing when the body is empty or not JSON
+async function readJson(res) {
+  try {
+    const text = await res.text();
+    if (!text) return null;
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 const STATES = ["Karnataka","Tamil Nadu","Kerala","Maharashtra","Delhi","Gujarat","Rajasthan","Uttar Pradesh","West Bengal","Telangana","Andhra Pradesh","Madhya Pradesh","Bihar","Punjab","Haryana","Odisha","Assam","Other"];
 
 export default function CheckoutPage() {
   const dispatch = useDispatch();
   const router = useRouter();
   const { cartItems, buyNowItem, promoApplied, promoCode } = useSelector((s) => s.cart);
-  const { user, authFetch } = useAuth();
+  const { user, authFetch, token } = useAuth();
 
   // If buyNowItem is set, checkout only that single item; otherwise use full cart
   const checkoutItems = buyNowItem ? [buyNowItem] : cartItems;
@@ -50,7 +61,11 @@ export default function CheckoutPage() {
   const [couponApplied, setCouponApplied] = useState(promoApplied);
   const [couponLoading, setCouponLoading] = useState(false);
 
-  const [form, setForm] = useState({ type: "home", name: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
+  const [form, setForm] = useState({ type: "home", name: "", email: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
+
+  // Calculate total packets for validation (6-multiple check)
+  const totalPackets = checkoutItems.reduce((sum, item) => sum + (item.qty * 6), 0);
+  const isMultipleOfSix = totalPackets % 6 === 0;
 
   // Handle coupon application
   const handleApplyCoupon = async () => {
@@ -149,7 +164,7 @@ export default function CheckoutPage() {
     setAddresses((prev) => [saved, ...prev.filter((a) => !String(a._id || a.id).startsWith("local-"))]);
     setSelectedAddr(saved._id);
     setShowForm(false);
-    setForm({ type: "home", name: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
+    setForm({ type: "home", name: "", email: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
     setFormErrors({});
     return saved;
   };
@@ -220,7 +235,7 @@ export default function CheckoutPage() {
       setAddresses((prev) => [saved, ...prev]);
       setSelectedAddr(saved._id);
       setShowForm(false);
-      setForm({ type: "home", name: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
+      setForm({ type: "home", name: "", email: "", street: "", city: "", state: "Karnataka", pincode: "", phone: "", isDefault: false });
       setFormErrors({});
       toast.success("Address saved!");
     } catch {
@@ -230,19 +245,77 @@ export default function CheckoutPage() {
 
   const handlePlaceOrder = async () => {
     if (placing) return;
-    if (!user) {
-      toast.error("Please login before placing the order");
-      router.push("/login?next=/checkout");
+    
+    // Block if not 6-multiple
+    if (!isMultipleOfSix) {
+      const remainderPackets = totalPackets % 6;
+      if (remainderPackets < 3) {
+        toast.error(`Remove ${remainderPackets} packet${remainderPackets > 1 ? 's' : ''} or add ${6 - remainderPackets} more to proceed (orders must be 6-packet multiples)`);
+      } else {
+        toast.error(`Add ${6 - remainderPackets} more packet${6 - remainderPackets > 1 ? 's' : ''} or remove ${remainderPackets} to proceed (orders must be 6-packet multiples)`);
+      }
       return;
     }
+    
     const addr = addresses.find((a) => a._id === selectedAddr);
     if (!addr) { toast.error("Please select a delivery address"); return; }
+    
+    // For non-authenticated users, check if email has previous orders
+    if (!user) {
+      const email = addr.email || form.email;
+      if (!email || !email.trim()) {
+        toast.error("Email is required for checkout");
+        return;
+      }
+      
+      // Validate email format
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+        toast.error("Please enter a valid email address");
+        return;
+      }
+      
+      // Check if this email has ordered before
+      try {
+        const checkRes = await fetch("/api/orders/check-email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email.trim() }),
+        });
+        const checkData = await readJson(checkRes);
+        
+        if (checkData && checkData.requiresLogin) {
+          toast("You've ordered before! Please login to continue", { icon: "🔐", duration: 5000 });
+          // Store current cart state before redirecting
+          localStorage.setItem("pendingCheckout", JSON.stringify({ 
+            items: checkoutItems,
+            address: addr,
+            paymentMethod: payMethod,
+            notes
+          }));
+          router.push("/login?next=/checkout");
+          return;
+        }
+      } catch (err) {
+        console.error("Email check failed:", err);
+        // Allow checkout to proceed if check fails
+      }
+    }
+    
     setPlacing(true);
     dispatch(savePaymentMethod(payMethod));
 
     try {
-      const res = await authFetch("/api/orders", {
+      const checkoutFetch = user ? authFetch : fetch;
+      const headers = {
+        "Content-Type": "application/json",
+      };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      
+      const res = await checkoutFetch("/api/orders", {
         method: "POST",
+        headers,
         body: JSON.stringify({
           items: checkoutItems.map((i) => ({
             productId: i._id || i.id,
@@ -254,8 +327,18 @@ export default function CheckoutPage() {
             flavor: i.flavor,
             netWeight: i.netWeight,
           })),
-          shippingAddress: { name: addr.name || addr.full_name, phone: addr.phone, street: addr.street || addr.address_line1, city: addr.city, state: addr.state, pincode: addr.pincode },
-          paymentMethod: payMethod, orderNotes: notes,
+          shippingAddress: { 
+            name: addr.name || addr.full_name, 
+            phone: addr.phone, 
+            email: addr.email || form.email || "",
+            street: addr.street || addr.address_line1, 
+            city: addr.city, 
+            state: addr.state, 
+            pincode: addr.pincode 
+          },
+          customer_email: addr.email || form.email || "",
+          paymentMethod: payMethod, 
+          orderNotes: notes,
           couponCode: couponApplied ? couponCode : null,
         }),
       });
@@ -265,6 +348,7 @@ export default function CheckoutPage() {
       if (!data.requiresPayment) {
         dispatch(clearBuyNowItem());
         dispatch(clearCart());
+        localStorage.removeItem("pendingCheckout");
         router.push(`/order-confirmation?orderId=${data.order.id}`);
         return;
       }
@@ -280,31 +364,48 @@ export default function CheckoutPage() {
         name: "WIN-DIA",
         description: `Order ${data.order.order_number}`,
         image: "/images/windia-logo.png",
-        prefill: { name: addr.name, contact: addr.phone, email: user?.email || "" },
+        prefill: { name: addr.name, contact: addr.phone, email: addr.email || form.email || "" },
         theme: { color: "#3B1F0F" },
         handler: async (response) => {
           try {
-            const vRes = await authFetch("/api/payment/verify", {
+            const vHeaders = {
+              "Content-Type": "application/json",
+            };
+            if (token) {
+              vHeaders.Authorization = `Bearer ${token}`;
+            }
+            const vRes = await fetch("/api/payment/verify", {
               method: "POST",
+              headers: vHeaders,
               body: JSON.stringify({ orderId: data.order.id, razorpay_order_id: response.razorpay_order_id, razorpay_payment_id: response.razorpay_payment_id, razorpay_signature: response.razorpay_signature }),
             });
-            const vData = await vRes.json();
-            if (vData.success) { dispatch(clearBuyNowItem()); dispatch(clearCart()); toast.success("Payment successful!"); router.push(`/order-confirmation?orderId=${data.order.id}`); }
-            else toast.error(vData.error || "Payment verification failed");
+            const vData = await readJson(vRes);
+            if (vData && vData.success) { 
+              dispatch(clearBuyNowItem()); 
+              dispatch(clearCart()); 
+              localStorage.removeItem("pendingCheckout");
+              toast.success("Payment successful!"); 
+              router.push(`/order-confirmation?orderId=${data.order.id}`); 
+            }
+            else toast.error((vData && vData.error) || "Payment verification failed");
           } finally { setPlacing(false); }
         },
         modal: {
           ondismiss: async () => {
-            // User closed the Razorpay popup without paying. Mark the order as
-            // cancelled instead of leaving it stuck at "placed / pending" forever
-            // with no way to tell it apart from a genuinely in-progress order.
             try {
-              await authFetch(`/api/orders/${data.order.id}`, {
+              const dHeaders = {
+                "Content-Type": "application/json",
+              };
+              if (token) {
+                dHeaders.Authorization = `Bearer ${token}`;
+              }
+              await fetch(`/api/orders/${data.order.id}`, {
                 method: "PATCH",
+                headers: dHeaders,
                 body: JSON.stringify({ action: "cancel", reason: "Payment cancelled by customer" }),
               });
             } catch {
-              // Best-effort — even if this fails, don't block the UI on it.
+              // Best-effort
             } finally {
               setPlacing(false);
               toast("Payment cancelled — order was not placed");
@@ -314,8 +415,15 @@ export default function CheckoutPage() {
       });
       rzp.on("payment.failed", async () => {
         try {
-          await authFetch(`/api/orders/${data.order.id}`, {
+          const fHeaders = {
+            "Content-Type": "application/json",
+          };
+          if (token) {
+            fHeaders.Authorization = `Bearer ${token}`;
+          }
+          await fetch(`/api/orders/${data.order.id}`, {
             method: "PATCH",
+            headers: fHeaders,
             body: JSON.stringify({ action: "cancel", reason: "Payment failed" }),
           });
         } catch {
@@ -402,10 +510,16 @@ export default function CheckoutPage() {
                             {formErrors.name && <span className={styles.errMsg}>{formErrors.name}</span>}
                           </div>
                           <div className={`${styles.formGroup} ${styles.span2}`}>
+                            <label>Email *</label>
+                            <input type="email" placeholder="your@email.com" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} className={formErrors.email ? styles.inputError : ""} />
+                            {formErrors.email && <span className={styles.errMsg}>{formErrors.email}</span>}
+                          </div>
+                          <div className={`${styles.formGroup} ${styles.span2}`}>
                             <label>Phone *</label>
                             <input type="tel" placeholder="10-digit mobile" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} className={formErrors.phone ? styles.inputError : ""} />
                             {formErrors.phone && <span className={styles.errMsg}>{formErrors.phone}</span>}
                           </div>
+                          <div className={`${styles.formGroup} ${styles.span2}`}></div>
                           <div className={`${styles.formGroup} ${styles.span4}`}>
                             <label>Street Address *</label>
                             <textarea rows={2} placeholder="House No., Street, Landmark" value={form.street} onChange={(e) => setForm({ ...form, street: e.target.value })} className={formErrors.street ? styles.inputError : ""} />
