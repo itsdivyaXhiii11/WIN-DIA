@@ -98,6 +98,32 @@ export function calculateBundlePricing(bundles: number) {
 }
 
 /**
+ * Prices a whole ORDER from the bundle count of each line.
+ *
+ * Tiered pricing applies to the TOTAL number of bundles in the order, across
+ * every flavour/product ("applies identically across ALL varieties"), so the
+ * customer pays the same whether they buy 2 bundles of one flavour or one
+ * bundle each of two flavours. This is exactly what the cart and checkout
+ * pages display (384 + (N - 1) × 256).
+ *
+ * @param bundleCounts - bundles per order line (each >= 1)
+ * @returns Order subtotal plus the average per-bundle price to store on each line
+ */
+export function calculateOrderBundlePricing(bundleCounts: number[]) {
+  const totalBundles = bundleCounts.reduce((sum, n) => sum + Math.max(0, Math.floor(n)), 0);
+  if (totalBundles < 1) {
+    return { totalBundles: 0, subtotal: 0, unitPrice: 0, packetsShipped: 0 };
+  }
+  const pricing = calculateBundlePricing(totalBundles);
+  return {
+    totalBundles,
+    subtotal: pricing.lineTotal,
+    unitPrice: pricing.unitPrice,
+    packetsShipped: pricing.packetsShipped,
+  };
+}
+
+/**
  * Calculates the full order pricing given line items and optional discount.
  *
  * @param itemsSubtotal - Sum of all line totals (bundles × BUNDLE_PRICE)

@@ -15,7 +15,8 @@ import { ProductRepository } from '../repositories/product.repository';
 import { OrderRepository } from '../repositories/order.repository';
 import { logger } from '../utils/logger.util';
 import { container, RepositoryTokens, ServiceTokens } from '../providers/container.provider';
-import { BundlePricing, calculateBundlePricing, calculateOrderTotal } from '../constants/bundle-pricing.constants';
+import { BundlePricing, calculateBundlePricing, calculateOrderBundlePricing, calculateOrderTotal } from '../constants/bundle-pricing.constants';
+import { parseComboSelections } from '../constants/combo-flavors.constants';
 import { autoBookShipment } from './auto-shipment.util';
 
 export interface CheckoutResult {
@@ -230,23 +231,28 @@ export class CheckoutServiceImpl implements CheckoutService {
    * STEP 4: ORDER_PAYLOAD_CREATION & STOCK_VALIDATION (BUNDLE PRICING ENFORCED)
    * Maps raw cart items to order-item snapshots, resolving real product IDs
    * (UUID → slug → flavor/name — rejecting the checkout if none match),
-   * enforcing server-side bundle pricing, and validating stock for each item.
+   * enforcing server-side bundle pricing (tiered across the WHOLE order),
+   * validating combo selections, and validating stock per product.
    */
   private async prepareOrderItems(rawItems: any[]): Promise<Result<PreparedOrderItems, AppError>> {
     const step4Start = Date.now();
     console.log(`[TRACE STEP 4: ORDER_PAYLOAD_CREATION & STOCK_VALIDATION] Mapping items to order snapshots with BUNDLE PRICING`);
-    const preparedOrderItems: Record<string, unknown>[] = [];
-    let subtotal = 0;
+
+    interface LineDraft {
+      productId: string;
+      productName: string;
+      bundles: number;
+      displayName: string;
+      image: string | null;
+      weightPerBundle: number;
+      flavor: string | null;
+    }
+    const drafts: LineDraft[] = [];
+    const productsById = new Map<string, { name: string; stock: number }>();
 
     for (const item of rawItems) {
       // qty from frontend represents number of BUNDLES (enforced by frontend selector)
       const bundles = Math.max(BundlePricing.MIN_BUNDLES, Math.min(BundlePricing.MAX_BUNDLES_PER_ITEM, Math.floor(parseInt(item.qty || item.quantity) || 1)));
-      const bundlePricing = calculateBundlePricing(bundles);
-
-      // SERVER-SIDE PRICE ENFORCEMENT: Never trust frontend-sent price.
-      // Use tiered pricing: total = 384 + (N - 1) × 256
-      const itemTotal = bundlePricing.lineTotal;
-      subtotal += itemTotal;
 
       const rawId = item.productId || item.product_id || item.id || item._id;
       const validProductIdRes = await this.resolveProductId(rawId, item);
@@ -266,7 +272,7 @@ export class CheckoutServiceImpl implements CheckoutService {
       // SECURITY: Fetch authoritative product weight from database, ignore frontend-submitted weight
       const catalogProduct = prodExistsCheck.value;
       const catalogWeight = catalogProduct.net_weight; // e.g., "480g" from products table
-      
+
       let weightPerBundle: number;
       if (typeof catalogWeight === 'string') {
         const parsed = parseInt(catalogWeight.replace(/[^0-9]/g, ''), 10);
@@ -287,33 +293,71 @@ export class CheckoutServiceImpl implements CheckoutService {
         ));
       }
 
-      // Stock validation: check against packets to be SHIPPED (12 per bundle)
-      // This is the real quantity that leaves the warehouse
-      console.log(`[TRACE STEP 4: STOCK_VALIDATION] Product resolved: id=${validProductId}, name="${item.name}", rawId="${rawId}"`);
-      console.log(`[TRACE STEP 4: STOCK_VALIDATION] Calling InventoryService.validateStock for productId: ${validProductId}, packetsShipped: ${bundlePricing.packetsShipped}`);
-      const stockRes = await this.inventoryService.validateStock(validProductId, bundlePricing.packetsShipped);
-      if (!stockRes.success) {
-        console.log(`[TRACE STEP 4: STOCK_VALIDATION] Insufficient stock for productId=${validProductId}:`, stockRes.error);
-        return failure(new ValidationError(
-          `Insufficient stock for "${item.name || 'product'}". Requested ${bundles} bundle(s) (${bundlePricing.packetsShipped} packets) but not enough inventory available.`
-        ));
+      // Combo lines: validate the chosen flavours and record them on the order item
+      let flavor: string | null = item.flavor || null;
+      if (item.flavorSelections) {
+        const combo = parseComboSelections(item.flavorSelections);
+        if (!combo.ok) {
+          return failure(new ValidationError(`${item.name || 'Combo'}: ${combo.reason}`));
+        }
+        flavor = combo.summary ?? null;
       }
 
-      preparedOrderItems.push({
-        product_id: validProductId,
-        name: item.name || item.product_name || 'WIN-DIA Product',
-        // Store the per-bundle unit price (average price per bundle for this quantity)
-        price: bundlePricing.unitPrice,
-        // qty = number of bundles ordered
-        qty: bundles,
-        flavor: item.flavor || null,
-        // CRITICAL: Store weight PER BUNDLE (not total line weight)
-        // DTDC will multiply this by qty to get total weight
-        // For WIN-DIA: 1 bundle = 6 packets × 40g = 240g
-        net_weight_grams: weightPerBundle,
+      productsById.set(validProductId, {
+        name: item.name || catalogProduct.name || 'product',
+        stock: Number(catalogProduct.count_in_stock) || 0,
+      });
+      drafts.push({
+        productId: validProductId,
+        productName: item.name || catalogProduct.name || 'product',
+        bundles,
+        displayName: item.name || item.product_name || 'WIN-DIA Product',
         image: item.image || item.image_url || null,
+        weightPerBundle,
+        flavor,
       });
     }
+
+    // Stock validation: check against packets to be SHIPPED, summed per product.
+    // Several lines can point at the same product (e.g. combos with different
+    // flavour selections), so each line passing alone is not enough.
+    const packetsByProduct = new Map<string, number>();
+    for (const d of drafts) {
+      const packets = calculateBundlePricing(d.bundles).packetsShipped;
+      packetsByProduct.set(d.productId, (packetsByProduct.get(d.productId) || 0) + packets);
+    }
+    for (const [productId, packetsNeeded] of packetsByProduct) {
+      console.log(`[TRACE STEP 4: STOCK_VALIDATION] Calling InventoryService.validateStock for productId: ${productId}, packetsShipped: ${packetsNeeded}`);
+      const stockRes = await this.inventoryService.validateStock(productId, packetsNeeded);
+      if (!stockRes.success) {
+        const info = productsById.get(productId);
+        console.log(`[TRACE STEP 4: STOCK_VALIDATION] Insufficient stock for productId=${productId}:`, stockRes.error);
+        const bundlesNeeded = packetsNeeded / BundlePricing.PACKETS_SHIPPED_PER_BUNDLE;
+        return failure(new ValidationError(
+          `Insufficient stock for "${info?.name || 'product'}". You ordered ${bundlesNeeded} bundle(s) (${packetsNeeded} packets) but only ${info?.stock ?? 0} packet(s) are in stock.`
+        ));
+      }
+    }
+
+    // SERVER-SIDE PRICE ENFORCEMENT: Never trust frontend-sent price.
+    // Tiered pricing over the whole order: total = 384 + (N - 1) × 256
+    const orderPricing = calculateOrderBundlePricing(drafts.map((d) => d.bundles));
+    const subtotal = orderPricing.subtotal;
+
+    const preparedOrderItems: Record<string, unknown>[] = drafts.map((d) => ({
+      product_id: d.productId,
+      name: d.displayName,
+      // Per-bundle price: the order's average price per bundle at its tier
+      price: orderPricing.unitPrice,
+      // qty = number of bundles ordered
+      qty: d.bundles,
+      flavor: d.flavor,
+      // CRITICAL: Store weight PER BUNDLE (not total line weight)
+      // DTDC will multiply this by qty to get total weight
+      net_weight_grams: d.weightPerBundle,
+      image: d.image,
+    }));
+
     const step4Time = Date.now() - step4Start;
     console.log(`[TRACE STEP 4: ORDER_PAYLOAD_CREATION] SUCCESS | Time: ${step4Time}ms | Subtotal: ${subtotal}`, preparedOrderItems);
 
@@ -328,10 +372,12 @@ export class CheckoutServiceImpl implements CheckoutService {
     const step5Start = Date.now();
     let discount = 0;
     let validatedCouponId: string | null = null;
-    if (dto.coupon_code) {
-      console.log(`[TRACE STEP 5: COUPON_VALIDATION] Calling CouponService.calculateDiscount for code: ${dto.coupon_code}`);
+    // Accept both snake_case and camelCase (the checkout page sends coupon_code)
+    const couponCode = String(dto.coupon_code || (dto as { couponCode?: string }).couponCode || '').trim();
+    if (couponCode) {
+      console.log(`[TRACE STEP 5: COUPON_VALIDATION] Calling CouponService.calculateDiscount for code: ${couponCode}`);
       const couponRes = await this.couponService.calculateDiscount({
-        code: dto.coupon_code,
+        code: couponCode,
         cart_total: subtotal,
       });
       if (couponRes.success) {

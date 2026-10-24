@@ -10,7 +10,8 @@ import {
   FiChevronRight, FiLoader, FiTag
 } from "react-icons/fi";
 import toast from "react-hot-toast";
-import { saveShippingAddress, savePaymentMethod, clearCart, clearBuyNowItem, setPromoApplied, setPromoCode } from "@/src/frontend/redux/slices/cartSlice";
+import { saveShippingAddress, savePaymentMethod, clearCart, clearBuyNowItem, setPromoApplied, setPromoCode, getCartItemKey } from "@/src/frontend/redux/slices/cartSlice";
+import { comboSummary } from "@/src/frontend/lib/comboFlavors";
 import { useAuth } from "@/src/frontend/hooks/useAuth";
 import { validateAddress } from "@/src/frontend/lib/validation";
 import styles from "./CheckoutPage.module.css";
@@ -25,6 +26,16 @@ function loadRazorpay() {
     s.src = RAZORPAY_SCRIPT; s.onload = () => resolve(true); s.onerror = () => resolve(false);
     document.body.appendChild(s);
   });
+}
+
+// Keeps a copy of the just-placed order for the confirmation page. Guests have
+// no session, so they can't fetch the order from the (authenticated) API.
+function rememberOrder(order, patch = {}) {
+  try {
+    sessionStorage.setItem("lastOrder", JSON.stringify({ ...order, ...patch }));
+  } catch {
+    // Storage unavailable — confirmation page falls back to the API
+  }
 }
 
 // Safe JSON reader: returns null instead of throwing when the body is empty or not JSON
@@ -243,6 +254,37 @@ export default function CheckoutPage() {
     }
   };
 
+  const handleContinue = () => {
+    if (!selectedAddr) { toast.error("Select an address"); return; }
+    const a = addresses.find((x) => x._id === selectedAddr);
+    if (!a) { toast.error("Select an address"); return; }
+    // Guests need an email on the address (older saved addresses may lack one)
+    if (!user && !(a.email || "").trim()) {
+      setForm({ type: a.type || "home", name: a.name || "", email: "", street: a.street || "", city: a.city || "", state: a.state || "Karnataka", pincode: a.pincode || "", phone: a.phone || "", isDefault: Boolean(a.isDefault) });
+      setShowForm(true);
+      toast.error("Please add your email so we can send your order details");
+      return;
+    }
+    dispatch(saveShippingAddress(a));
+    setStep(2);
+  };
+
+  // Runs once an order is placed (COD) or paid (online)
+  const finishOrder = (order, patch = {}) => {
+    rememberOrder(order, patch);
+    // "Buy now" purchases only that item — don't wipe the regular cart
+    if (buyNowItem) {
+      dispatch(clearBuyNowItem());
+    } else {
+      dispatch(clearCart());
+    }
+    // The coupon has been used; don't carry it into the next order
+    dispatch(setPromoApplied(false));
+    dispatch(setPromoCode(""));
+    localStorage.removeItem("pendingCheckout");
+    router.push(`/order-confirmation?orderId=${order.id}`);
+  };
+
   const handlePlaceOrder = async () => {
     if (placing) return;
     
@@ -259,11 +301,14 @@ export default function CheckoutPage() {
     
     const addr = addresses.find((a) => a._id === selectedAddr);
     if (!addr) { toast.error("Please select a delivery address"); return; }
+
+    // Contact email: the address's email (guests), else the form, else the account email
+    const contactEmail = (addr.email || form.email || user?.email || "").trim();
     
     // For non-authenticated users, check if email has previous orders
     if (!user) {
-      const email = addr.email || form.email;
-      if (!email || !email.trim()) {
+      const email = contactEmail;
+      if (!email) {
         toast.error("Email is required for checkout");
         return;
       }
@@ -326,30 +371,29 @@ export default function CheckoutPage() {
             qty: i.qty,
             flavor: i.flavor,
             netWeight: i.netWeight,
+            // Combo lines: the chosen flavours, so the server can validate and record them
+            flavorSelections: i.flavorSelections || undefined,
           })),
           shippingAddress: { 
             name: addr.name || addr.full_name, 
             phone: addr.phone, 
-            email: addr.email || form.email || "",
-            street: addr.street || addr.address_line1, 
+            email: contactEmail,
+            street: addr.street || addr.address_line1,
             city: addr.city, 
             state: addr.state, 
             pincode: addr.pincode 
           },
-          customer_email: addr.email || form.email || "",
+          customer_email: contactEmail,
           paymentMethod: payMethod, 
           orderNotes: notes,
-          couponCode: couponApplied ? couponCode : null,
+          coupon_code: couponApplied ? couponCode.trim() : null,
         }),
       });
       const data = await res.json();
       if (!data.success) { toast.error(data.error || "Could not place order"); setPlacing(false); return; }
 
       if (!data.requiresPayment) {
-        dispatch(clearBuyNowItem());
-        dispatch(clearCart());
-        localStorage.removeItem("pendingCheckout");
-        router.push(`/order-confirmation?orderId=${data.order.id}`);
+        finishOrder(data.order);
         return;
       }
 
@@ -364,7 +408,7 @@ export default function CheckoutPage() {
         name: "WIN-DIA",
         description: `Order ${data.order.order_number}`,
         image: "/images/windia-logo.png",
-        prefill: { name: addr.name, contact: addr.phone, email: addr.email || form.email || "" },
+        prefill: { name: addr.name, contact: addr.phone, email: contactEmail },
         theme: { color: "#3B1F0F" },
         handler: async (response) => {
           try {
@@ -381,11 +425,8 @@ export default function CheckoutPage() {
             });
             const vData = await readJson(vRes);
             if (vData && vData.success) { 
-              dispatch(clearBuyNowItem()); 
-              dispatch(clearCart()); 
-              localStorage.removeItem("pendingCheckout");
               toast.success("Payment successful!"); 
-              router.push(`/order-confirmation?orderId=${data.order.id}`); 
+              finishOrder(data.order, { payment_status: "paid" });
             }
             else toast.error((vData && vData.error) || "Payment verification failed");
           } finally { setPlacing(false); }
@@ -459,13 +500,13 @@ export default function CheckoutPage() {
 
           {/* Steps */}
           <div className={styles.steps}>
-            {["Delivery Details", "Review", "Payment"].map((label, i) => (
+            {["Delivery Details", "Payment"].map((label, i) => (
               <div key={label} className={styles.stepGroup}>
                 <div className={`${styles.step} ${step > i + 1 ? styles.stepDone : ""} ${step === i + 1 ? styles.stepActive : ""}`}>
                   <span>{step > i + 1 ? <FiCheck /> : i + 1}</span>
                   <p>{label}</p>
                 </div>
-                {i < 2 && <div className={`${styles.stepLine} ${step > i + 1 ? styles.stepLineDone : ""}`} />}
+                {i < 1 && <div className={`${styles.stepLine} ${step > i + 1 ? styles.stepLineDone : ""}`} />}
               </div>
             ))}
           </div>
@@ -599,7 +640,7 @@ export default function CheckoutPage() {
                   </div>
 
                   <div className={styles.stepFooter}>
-                    <button className={styles.proceedBtn} onClick={() => { if (!selectedAddr) { toast.error("Select an address"); return; } const a = addresses.find((x) => x._id === selectedAddr); dispatch(saveShippingAddress(a)); setStep(2); }} disabled={!selectedAddr}>
+                    <button className={styles.proceedBtn} onClick={handleContinue} disabled={!selectedAddr}>
                       Continue to Payment <FiChevronRight />
                     </button>
                   </div>
@@ -658,16 +699,20 @@ export default function CheckoutPage() {
               <div className="gold-divider" style={{ margin: "12px 0 16px" }} />
 
               <div className={styles.summaryItems}>
-                {checkoutItems.map((item) => (
-                  <div key={item._id || item.id} className={styles.summaryItem}>
-                    <img src={item.image || "/images/product-methi.jpg"} alt={item.name} />
-                    <div>
-                      <p className={styles.sItemName}>{item.name}</p>
-                      <p className={styles.sItemQty}>× {item.qty} {item.qty === 1 ? 'bundle' : 'bundles'}</p>
+                {checkoutItems.map((item) => {
+                  const contents = comboSummary(item.flavorSelections);
+                  return (
+                    <div key={getCartItemKey(item)} className={styles.summaryItem}>
+                      <img src={item.image || "/images/product-methi.jpg"} alt={item.name} />
+                      <div>
+                        <p className={styles.sItemName}>{item.name}</p>
+                        <p className={styles.sItemQty}>× {item.qty} {item.qty === 1 ? 'bundle' : 'bundles'}</p>
+                        {contents && <p className={styles.sItemQty} style={{ whiteSpace: "normal" }}>{contents}</p>}
+                      </div>
+                      <span className={styles.sItemPrice}>{item.qty} × 6 packets</span>
                     </div>
-                    <span className={styles.sItemPrice}>{item.qty} × 6 packets</span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
               {/* Promo Code Section */}
