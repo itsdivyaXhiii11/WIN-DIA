@@ -42,7 +42,7 @@ function generateOrderNumber(): string {
 }
 
 export interface OrderService {
-  createOrder(userId: string, orderData: Partial<Order>): Promise<Result<Order, AppError>>;
+  createOrder(userId: string | null, orderData: Partial<Order>): Promise<Result<Order, AppError>>;
   createOrderItems(orderId: string, items: Partial<OrderItem>[]): Promise<Result<OrderItem[], AppError>>;
   getOrderById(orderId: string, userId?: string): Promise<Result<Order, AppError>>;
   getOrderByNumber(orderNumber: string, userId?: string): Promise<Result<Order, AppError>>;
@@ -73,7 +73,7 @@ export class OrderServiceImpl implements OrderService {
     this.inventoryService = inventoryService || container.resolve<InventoryService>(ServiceTokens.InventoryService);
   }
 
-  public async createOrder(userId: string, orderData: Partial<Order>): Promise<Result<Order, AppError>> {
+  public async createOrder(userId: string | null, orderData: Partial<Order>): Promise<Result<Order, AppError>> {
     const start = Date.now();
     logger.info(`[OrderService.createOrder] Creating order for user ${userId}`);
     const orderNumber = orderData.order_number || generateOrderNumber();
@@ -91,6 +91,8 @@ export class OrderServiceImpl implements OrderService {
       total_price: orderData.total_price || 0,
       shipping_address: orderData.shipping_address || {},
       order_notes: orderData.order_notes || null,
+      customer_email: orderData.customer_email || null,
+      customer_phone: orderData.customer_phone || null,
     };
 
     console.log(`[OrderService.createOrder] Repository: OrderRepository | Method: create | Payload:`, payload);
@@ -108,7 +110,7 @@ export class OrderServiceImpl implements OrderService {
     }
 
     console.log(`[OrderService.createOrder] SUCCESS | Time: ${elapsed}ms | Created Order ID: ${newOrderRes.value.id}`);
-    await this.writeStatusHistory(newOrderRes.value.id, OrderStatus.PLACED, 'Order placed successfully', userId);
+    await this.writeStatusHistory(newOrderRes.value.id, OrderStatus.PLACED, 'Order placed successfully', userId ?? undefined);
     return success(newOrderRes.value);
   }
 

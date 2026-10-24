@@ -76,7 +76,7 @@ export class SupabaseOrderRepository
    */
   private async insertOrder(
     client: SupabaseClient,
-    userId: string,
+    userId: string | null,
     orderData: Record<string, unknown>
   ) {
     return client
@@ -94,6 +94,9 @@ export class SupabaseOrderRepository
         total_price: Number(orderData.total_price || 0),
         shipping_address: orderData.shipping_address || {},
         order_notes: orderData.order_notes || null,
+        // Required by chk_guest_orders_have_contact for guest orders (user_id IS NULL)
+        customer_email: orderData.customer_email || null,
+        customer_phone: orderData.customer_phone || null,
       })
       .select('*')
       .single();
