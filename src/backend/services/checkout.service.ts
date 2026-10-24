@@ -441,7 +441,7 @@ export class CheckoutServiceImpl implements CheckoutService {
    * step by step via the individual services/repositories.
    */
   private async createOrderFallback(
-    userId: string,
+    userId: string | null,
     dto: CreateOrderDTO,
     selectedAddress: any,
     preparedOrderItems: Record<string, unknown>[],
@@ -449,6 +449,9 @@ export class CheckoutServiceImpl implements CheckoutService {
     pricing: { subtotal: number; discount: number; tax: number; shipping: number; total: number }
   ): Promise<Result<OrderCreationOutcome, AppError>> {
     const { subtotal, discount, tax, shipping, total } = pricing;
+
+    const customerEmail = (dto as any).customer_email || (dto as any).email || selectedAddress.email || null;
+    const customerPhone = selectedAddress.phone || null;
 
     const orderRes = await this.orderService.createOrder(userId, {
       items_price: subtotal,
@@ -460,6 +463,8 @@ export class CheckoutServiceImpl implements CheckoutService {
       payment_method: selectedPaymentMethod,
       shipping_address: selectedAddress as any,
       order_notes: dto.order_notes || (dto as any).orderNotes || null,
+      customer_email: customerEmail,
+      customer_phone: customerPhone,
     });
 
     if (!orderRes.success) {
