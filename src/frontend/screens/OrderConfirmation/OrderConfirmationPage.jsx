@@ -33,18 +33,46 @@ const getOnlineStatusLabels = () => ({
 export default function OrderConfirmationPage() {
   const searchParams = useSearchParams();
   const orderId = searchParams.get("orderId");
-  const { authFetch, user } = useAuth();
+  const { authFetch, user, token, loading: authLoading } = useAuth();
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!orderId || !authFetch) return;
-    authFetch(`/api/orders/${orderId}`)
-      .then((r) => r.json())
-      .then((d) => { if (d.success) setOrder(d.order); })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [orderId, authFetch]);
+    // Wait for the session to resolve — authFetch redirects to /login when
+    // there is no token yet.
+    if (authLoading) return;
+
+    let cancelled = false;
+    const finish = (o) => {
+      if (cancelled) return;
+      setOrder(o);
+      setLoading(false);
+    };
+
+    // Guests have no session, so they can't call the authenticated order API.
+    // Checkout leaves a copy of the order it just placed for them.
+    const savedOrder = () => {
+      try {
+        const o = JSON.parse(sessionStorage.getItem("lastOrder") || "null");
+        return o && String(o.id) === String(orderId) ? o : null;
+      } catch {
+        return null;
+      }
+    };
+
+    if (!orderId) {
+      Promise.resolve().then(() => finish(null));
+    } else if (!token) {
+      Promise.resolve().then(() => finish(savedOrder()));
+    } else {
+      authFetch(`/api/orders/${orderId}`)
+        .then((r) => r.json())
+        .then((d) => finish(d.success ? d.order : savedOrder()))
+        .catch(() => finish(savedOrder()));
+    }
+
+    return () => { cancelled = true; };
+  }, [orderId, authFetch, token, authLoading]);
 
   if (loading) return (
     <div className={styles.loadWrap}>
@@ -175,6 +203,7 @@ export default function OrderConfirmationPage() {
                               .map(([flavorId, count]) => {
                                 const flavorNames = {
                                   'curry-leaves': 'Curry Leaves',
+                                  'curry-leaf': 'Curry Leaves',
                                   'garlic': 'Garlic',
                                   'jeera': 'Jeera',
                                   'onion': 'Onion'
@@ -200,8 +229,8 @@ export default function OrderConfirmationPage() {
             <motion.div className={styles.card} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
               <h2><FiMapPin style={{ color: "var(--gold)" }} /> Delivery Address</h2>
               <div className={styles.addrBlock}>
-                <p className={styles.addrName}>{addr.name}</p>
-                <p>{addr.street}</p>
+                <p className={styles.addrName}>{addr.name || addr.full_name}</p>
+                <p>{addr.street || addr.address_line1}</p>
                 <p>{addr.city}, {addr.state} — {addr.pincode}</p>
                 <p>{addr.phone}</p>
               </div>

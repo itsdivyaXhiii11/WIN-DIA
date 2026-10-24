@@ -2,6 +2,17 @@ import { createSlice } from "@reduxjs/toolkit";
 
 const getId = (item) => item?._id || item?.id;
 
+// Server-side sanity cap (BundlePricing.MAX_BUNDLES_PER_ITEM)
+export const MAX_BUNDLES_PER_ITEM = 50;
+
+/**
+ * The key that uniquely identifies a cart LINE.
+ * Combo lines with different flavour selections share one product id, so they
+ * carry a `cartId`; every cart action (qty, remove, undo, React keys) must use
+ * this key rather than the bare product id.
+ */
+export const getCartItemKey = (item) => item?.cartId || getId(item);
+
 // Generate unique ID for combo products based on flavor selections
 const getUniqueComboId = (item) => {
   if (!item.flavorSelections) return getId(item);
@@ -52,7 +63,7 @@ const cartSlice = createSlice({
         
         if (existing) {
           // Item already exists, just increment quantity
-          existing.qty += Number(item.qty || 1);
+          existing.qty = Math.min(MAX_BUNDLES_PER_ITEM, existing.qty + Number(item.qty || 1));
         } else {
           // New item - check if there's an almost-duplicate (same product but no cartId)
           // This can happen if item is added before flavorSelections is set
@@ -85,7 +96,10 @@ const cartSlice = createSlice({
         const itemId = i.cartId || getId(i);
         return itemId === a.payload.id;
       });
-      if (item) item.qty = Math.max(1, Number(a.payload.qty));
+      if (item) {
+        const next = Math.floor(Number(a.payload.qty)) || 1;
+        item.qty = Math.min(MAX_BUNDLES_PER_ITEM, Math.max(1, next));
+      }
     },
     clearCart: (s) => { s.cartItems = []; },
     saveShippingAddress: (s, a) => { s.shippingAddress = a.payload; },

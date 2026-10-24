@@ -2,33 +2,35 @@
 import { useEffect, useRef } from "react";
 import { Provider, useDispatch, useSelector } from "react-redux";
 import store from "@/src/frontend/redux/store";
-import { setCart } from "@/src/frontend/redux/slices/cartSlice";
+import { setCart, getCartItemKey, MAX_BUNDLES_PER_ITEM } from "@/src/frontend/redux/slices/cartSlice";
 import { setWishlist } from "@/src/frontend/redux/slices/wishlistSlice";
 import { AuthProvider, useAuth } from "@/src/frontend/hooks/useAuth";
 import { useCartSync } from "@/src/frontend/hooks/useCartSync";
 import { useWishlistSync } from "@/src/frontend/hooks/useWishlistSync";
 import { Toaster } from "react-hot-toast";
 
-// Helper: Generate unique key for cart item matching (product + variant + size)
-function getItemMatchId(item) {
-  return `${item.product_id}_${item.variant_id || "null"}_${item.size || "null"}`;
-}
-
-// Helper: Merge guest cart into user cart (combine quantities for matching items)
+// Helper: Merge guest cart into user cart (combine quantities for matching lines).
+// A "line" is identified by getCartItemKey: the product id, or the combo's
+// unique cartId when it carries a flavour selection.
 function mergeCarts(guestCart, userCart) {
-  const merged = [...userCart];
-  const userItemsMap = new Map(merged.map((item) => [getItemMatchId(item), item]));
+  const merged = userCart.map((item) => ({ ...item }));
+  const byKey = new Map(merged.map((item) => [getCartItemKey(item), item]));
 
   guestCart.forEach((guestItem) => {
-    const matchId = getItemMatchId(guestItem);
-    const existingItem = userItemsMap.get(matchId);
+    const key = getCartItemKey(guestItem);
+    const existing = byKey.get(key);
 
-    if (existingItem) {
-      // Same product+variant+size exists - combine quantities
-      existingItem.quantity = (existingItem.quantity || 1) + (guestItem.quantity || 1);
+    if (existing) {
+      // Same line exists - combine quantities (capped like the server does)
+      existing.qty = Math.min(
+        MAX_BUNDLES_PER_ITEM,
+        (Number(existing.qty) || 1) + (Number(guestItem.qty) || 1)
+      );
     } else {
-      // New item - add to merged cart
-      merged.push(guestItem);
+      // New line - add to merged cart
+      const copy = { ...guestItem };
+      merged.push(copy);
+      byKey.set(key, copy);
     }
   });
 

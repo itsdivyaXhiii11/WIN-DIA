@@ -9,7 +9,12 @@ import {
   FiArrowLeft, FiTruck, FiShield, FiHeart, FiPackage, FiTag
 } from "react-icons/fi";
 import toast from "react-hot-toast";
-import { removeFromCart, updateQuantity, setCart, addToCart, setPromoApplied, setPromoCode } from "@/src/frontend/redux/slices/cartSlice";
+import {
+  removeFromCart, updateQuantity, addToCart,
+  setPromoApplied as setPromoAppliedAction, setPromoCode as setPromoCodeAction,
+  getCartItemKey, MAX_BUNDLES_PER_ITEM,
+} from "@/src/frontend/redux/slices/cartSlice";
+import { flavorLabel } from "@/src/frontend/lib/comboFlavors";
 import { addToWishlist } from "@/src/frontend/redux/slices/wishlistSlice";
 import styles from "./CartPage.module.css";
 
@@ -18,11 +23,11 @@ const FREE_THRESHOLD = 0; // Free delivery always — no threshold needed
 export default function CartPage() {
   const dispatch = useDispatch();
   const router = useRouter();
-  const { cartItems } = useSelector((s) => s.cart);
+  const { cartItems, promoApplied, promoCode } = useSelector((s) => s.cart);
   const { wishlistItems } = useSelector((s) => s.wishlist);
   const [mounted, setMounted] = useState(false);
-  const [promo, setPromo] = useState("");
-  const [promoApplied, setPromoApplied] = useState(false);
+  // The applied/not-applied state lives in Redux so the checkout page sees it.
+  const [promo, setPromo] = useState(promoApplied ? promoCode : "");
   const [promoLoading, setPromoLoading] = useState(false);
 
   useEffect(() => {
@@ -32,12 +37,14 @@ export default function CartPage() {
   }, []);
 
   const totalBundles = cartItems.reduce((sum, i) => sum + i.qty, 0);
-  
+
   // Apply tiered pricing formula: total = 384 + (N - 1) × 256
   // This matches the server-side calculation in bundle-pricing.constants.ts
   const tieredSubtotal = totalBundles > 0 ? 384 + (totalBundles - 1) * 256 : 0;
-  
+
   const subtotal = tieredSubtotal;
+  // Effective price per bundle at the current tier (same for every flavour)
+  const perBundle = totalBundles > 0 ? subtotal / totalBundles : 0;
   const discount = promoApplied ? subtotal * 0.1 : 0;
   const shipping = 0; // FREE DELIVERY — always ₹0
   // GST is deactivated: no separate tax line is added. Price shown already
@@ -46,26 +53,34 @@ export default function CartPage() {
   const progress = 100; // Always free shipping
   const remaining = 0;
 
-  const handleQty = useCallback((id, delta, curr, stock) => {
+  // `stock` is the product's count in PACKETS; each bundle is 6 packets.
+  const handleQty = useCallback((key, delta, curr, stock) => {
     const n = curr + delta;
     if (n < 1) return;
-    if (n > stock) { toast.error(`Only ${stock} in stock`); return; }
-    dispatch(updateQuantity({ id, qty: n }));
+    const maxBundles = Math.min(
+      MAX_BUNDLES_PER_ITEM,
+      Number.isFinite(stock) ? Math.floor(stock / 6) : MAX_BUNDLES_PER_ITEM
+    );
+    if (n > maxBundles) {
+      toast.error(maxBundles >= MAX_BUNDLES_PER_ITEM ? `Maximum ${MAX_BUNDLES_PER_ITEM} bundles per item` : `Only ${maxBundles} bundle${maxBundles === 1 ? "" : "s"} in stock`);
+      return;
+    }
+    dispatch(updateQuantity({ id: key, qty: n }));
   }, [dispatch]);
 
-  const handleRemove = (id, name) => {
-    const removed = cartItems.find((i) => (i._id || i.id) === id);
-    dispatch(removeFromCart(id));
+  const handleRemove = (item) => {
+    const key = getCartItemKey(item);
+    dispatch(removeFromCart(key));
     toast((t) => (
       <span className={styles.undoToast}>
-        <span>Removed <strong>{name}</strong></span>
-        <button onClick={() => { dispatch(addToCart(removed)); toast.dismiss(t.id); }}>Undo</button>
+        <span>Removed <strong>{item.name}</strong></span>
+        <button onClick={() => { dispatch(addToCart(item, item.qty)); toast.dismiss(t.id); }}>Undo</button>
       </span>
     ), { duration: 4000 });
   };
 
   const handleSaveLater = (item) => {
-    dispatch(removeFromCart(item._id || item.id));
+    dispatch(removeFromCart(getCartItemKey(item)));
     if (!wishlistItems.some((w) => (w._id || w.id) === (item._id || item.id))) {
       dispatch(addToWishlist(item));
       toast.success(`Saved to wishlist`);
@@ -79,7 +94,7 @@ export default function CartPage() {
       toast.error("Please enter a promo code");
       return;
     }
-    
+
     setPromoLoading(true);
     try {
       const res = await fetch("/api/coupons/validate", {
@@ -90,22 +105,27 @@ export default function CartPage() {
           cart_total: subtotal,
         }),
       });
-      
+
       const data = await res.json();
-      
+
       if (data.success) {
-        setPromoApplied(true);
-        dispatch(setPromoApplied(true)); // Save to Redux for checkout page
-        dispatch(setPromoCode(promo.trim())); // Save code to Redux
-        toast.success(`Promo applied! You saved ₹${data.data.discount_amount.toFixed(0)}`);
+        dispatch(setPromoAppliedAction(true)); // Saved to Redux for the checkout page
+        dispatch(setPromoCodeAction(promo.trim()));
+        toast.success(`Promo applied! You saved ₹${Number(data.data?.discount_amount || 0).toFixed(0)}`);
       } else {
         toast.error(data.error || "Invalid promo code");
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to apply promo code");
     } finally {
       setPromoLoading(false);
     }
+  };
+
+  const handleRemovePromo = () => {
+    setPromo("");
+    dispatch(setPromoAppliedAction(false));
+    dispatch(setPromoCodeAction(""));
   };
 
   const handleCheckout = () => {
@@ -166,24 +186,33 @@ export default function CartPage() {
           <div className={styles.itemsCol}>
             <AnimatePresence>
               {cartItems.map((item) => {
-                const id = item._id || item.id;
+                const key = getCartItemKey(item);
+                const productId = item._id || item.id;
+                const comboParts = item.flavorSelections
+                  ? Object.entries(item.flavorSelections).filter(([, count]) => count > 0)
+                  : [];
                 return (
                   <motion.div
-                    key={id}
+                    key={key}
                     className={styles.item}
                     initial={{ opacity: 0, y: 16 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, x: -40, height: 0, marginBottom: 0 }}
                     layout
                   >
-                    <Link href={`/product/${id}`} className={styles.itemImg}>
+                    <Link href={`/product/${productId}`} className={styles.itemImg}>
                       <img src={item.image || "/images/product-methi.jpg"} alt={item.name} />
                     </Link>
 
                     <div className={styles.itemInfo}>
-                      <Link href={`/product/${id}`} className={styles.itemName}>{item.name}</Link>
+                      <Link href={`/product/${productId}`} className={styles.itemName}>{item.name}</Link>
                       {item.flavor && <p className={styles.itemFlavor}>{item.flavor}</p>}
-                      {item.netWeight && <p className={styles.itemWeight}>{item.netWeight}g</p>}
+                      {comboParts.length > 0 && (
+                        <p className={styles.itemFlavor}>
+                          {comboParts.map(([id, count]) => `${flavorLabel(id)} ×${count}`).join(", ")}
+                        </p>
+                      )}
+                      <p className={styles.itemWeight}>6 packets per bundle</p>
 
                       <div className={styles.itemBadges}>
                         {item.isLowGI && <span className={styles.badge}>Low GI</span>}
@@ -192,8 +221,8 @@ export default function CartPage() {
                       </div>
 
                       <div className={styles.itemPriceRow}>
-                        <span className={styles.itemPrice}>₹{item.price}</span>
-                        {item.originalPrice > item.price && <span className={styles.itemOriginal}>₹{item.originalPrice}</span>}
+                        <span className={styles.itemPrice}>₹{perBundle.toFixed(0)}</span>
+                        <span className={styles.itemOriginal} style={{ textDecoration: "none" }}>per bundle</span>
                       </div>
 
                       <div className={styles.itemActions}>
@@ -205,12 +234,12 @@ export default function CartPage() {
 
                     <div className={styles.itemRight}>
                       <div className={styles.qtyControl}>
-                        <button onClick={() => handleQty(id, -1, item.qty, item.countInStock || 99)}><FiMinus /></button>
+                        <button onClick={() => handleQty(key, -1, item.qty, item.countInStock)} aria-label="Decrease quantity"><FiMinus /></button>
                         <span>{item.qty}</span>
-                        <button onClick={() => handleQty(id, 1, item.qty, item.countInStock || 99)}><FiPlus /></button>
+                        <button onClick={() => handleQty(key, 1, item.qty, item.countInStock)} aria-label="Increase quantity"><FiPlus /></button>
                       </div>
-                      <p className={styles.itemTotal}>₹{(item.price * item.qty).toFixed(0)}</p>
-                      <button className={styles.removeBtn} onClick={() => handleRemove(id, item.name)} aria-label="Remove"><FiTrash2 /></button>
+                      <p className={styles.itemTotal}>{item.qty} {item.qty === 1 ? "bundle" : "bundles"}</p>
+                      <button className={styles.removeBtn} onClick={() => handleRemove(item)} aria-label="Remove"><FiTrash2 /></button>
                     </div>
                   </motion.div>
                 );
@@ -231,7 +260,7 @@ export default function CartPage() {
                   <input
                     type="text"
                     placeholder="Promo code"
-                    value={promo}
+                    value={promoApplied ? promoCode : promo}
                     onChange={(e) => setPromo(e.target.value)}
                     disabled={promoApplied}
                     className={styles.promoInput}
@@ -245,15 +274,10 @@ export default function CartPage() {
                       {promoLoading ? "..." : "Apply"}
                     </button>
                   ) : (
-                    <button className={styles.promoRemove} onClick={() => { 
-                      setPromoApplied(false); 
-                      setPromo(""); 
-                      dispatch(setPromoApplied(false)); // Clear from Redux
-                      dispatch(setPromoCode("")); // Clear code from Redux
-                    }}>Remove</button>
+                    <button className={styles.promoRemove} onClick={handleRemovePromo}>Remove</button>
                   )}
                 </div>
-                {promoApplied && <p className={styles.promoSuccess}>✓ {promo.toUpperCase()} applied</p>}
+                {promoApplied && <p className={styles.promoSuccess}>✓ {(promoCode || promo).toUpperCase()} applied</p>}
               </div>
 
               {/* Breakdown */}
